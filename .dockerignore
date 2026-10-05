@@ -1,0 +1,7 @@
+.git/
+.gitignore
+.log/
+__pycache__/
+nombres.txt
+prompts/
+README.md
