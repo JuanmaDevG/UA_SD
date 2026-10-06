@@ -1,0 +1,18 @@
+#!/bin/bash
+
+usage_message=$(
+  cat <<EOF
+Usage:
+  manager <command>
+
+Options:
+  build - correct command to build container
+  clean - remove all of the container's data
+EOF
+)
+
+case "$1" in
+build) docker build -t wm . ;;
+clean) rm -rf /app ;;
+* | help | h) printf "%s\n" "${usage_message}" ;;
+esac
