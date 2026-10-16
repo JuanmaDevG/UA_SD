@@ -10,19 +10,81 @@ if [[ $BASH_SOURCE == ${0} ]]; then
   exit
 fi
 
-if [ ! -d .venv ] || [ ! -d kafka ]; then
-  printf "Set up your environment first:\n$ ./manager setup\n"
-  return
+if [[ $BASH_SOURCE == */* ]]; then
+  PROJECT_DIR="$(realpath ${BASH_SOURCE%/*})"
+else
+  PROJECT_DIR="$(realpath .)"
 fi
+
+echo "Type 'h' in your terminal to see available devtools"
+usage_message=$(
+  cat <<EOF
+Commands:
+  h                 - Print this help message
+  notools           - Unload devtools
+  manager <option>  - Manage this project's development environment
+    <option>:
+      build  - Build the container
+      reset  - Reset py virtual environment and kafka installation
+EOF
+)
+
+h() {
+  printf "$usage_message\n"
+}
+
+manager() {
+  local DIR
+  DIR=$(pwd)
+  cd $PROJECT_DIR
+
+  case "$1" in
+  build) docker build -t wm . ;;
+  setup)
+    if [ ! -d .venv ]; then
+      echo "manager: Making virtual environment..."
+      python3 -m venv .venv
+      source .venv/bin/activate
+      pip install -r requirements.txt
+    else
+      echo "manager: py virtual environment ready"
+    fi
+
+    if [ ! -d kafka ]; then
+      echo "manager: Downloading kafka..."
+      curl https://dlcdn.apache.org/kafka/4.3.1/kafka-4.3.1-src.tgz >kafka.tgz
+      tar -xf kafka.tgz
+      rm kafka.tgz
+      ls
+      rename 's/kafka.*/kafka/' kafka*
+    else
+      echo "manager: kafka binaries ready"
+    fi
+    ;;
+  reset)
+    rm -rf .venv kafka
+    manager setup
+    ;;
+  *)
+    h
+    ;;
+  esac
+
+  cd $DIR
+}
 
 notools() {
   deactivate
-  unalias manager
+  unset usage_message
+  unset PROJECT_DIR
+
   unset -f notools
+  unset -f manager
+  unset -f h
 }
 
-source .venv/bin/activate
-printf "Type notools in your terminal quit from devtools\n"
+if [ ! -d .venv ] || [ ! -d kafka ]; then
+  manager setup
+fi
 
-alias manager=$(realpath ./manager)
-# TODO: make more command helpers
+source .venv/bin/activate
