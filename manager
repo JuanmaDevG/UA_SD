@@ -3,16 +3,31 @@
 usage_message=$(
   cat <<EOF
 Usage:
-  manager <command>
+  manager <option>
 
-Options:
-  build - correct command to build container
-  clean - remove all of the container's data
+Available options:
+  build         - Build the container
+  setup         - Make environment for local development
 EOF
 )
 
 case "$1" in
 build) docker build -t wm . ;;
-clean) rm -rf /app ;;
+setup)
+  if [ ! -d .venv ]; then
+    echo "manager: Making virtual environment..."
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+  fi
+
+  if [ ! -d kafka ]; then
+    echo "manager: Downloading kafka..."
+    curl https://dlcdn.apache.org/kafka/4.3.1/kafka-4.3.1-src.tgz >kafka.tgz
+    tar -xf kafka.tgz
+    rm kafka.tgz
+    rename 's/kafka_.*/kafka/' kafka_*
+  fi
+  ;;
 * | help | h) printf "%s\n" "${usage_message}" ;;
 esac

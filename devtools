@@ -1,0 +1,13 @@
+#!/bin/bash
+# Development tools for local debugging and executing
+# Use it in your terminal:
+# $ source ./devtools
+
+if [ ! -d .venv ] || [ ! -d kafka ]; then
+  echo "Set up your environment first type:\n./manager setup"
+fi
+
+source .venv/bin/activate
+printf "Type deactivate in your terminal to quit from python virtual environment\n"
+
+# TODO: here more tools like debug sessions or so
