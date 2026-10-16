@@ -1,3 +1,2 @@
 flask
 confluent-kafka
-sqlite3

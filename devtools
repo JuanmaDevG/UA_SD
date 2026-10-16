@@ -1,13 +1,28 @@
 #!/bin/bash
-# Development tools for local debugging and executing
+# Development tools for local debugging
 # Use it in your terminal:
 # $ source ./devtools
 
-if [ ! -d .venv ] || [ ! -d kafka ]; then
-  echo "Set up your environment first type:\n./manager setup"
+# If I'm being executed, refuse, I must be sourced
+if [[ $BASH_SOURCE == ${0} ]]; then
+  printf "Don't execute me, do this instead:\n\$ source devtools\n"
+  chmod -x devtools
+  exit
 fi
 
-source .venv/bin/activate
-printf "Type deactivate in your terminal to quit from python virtual environment\n"
+if [ ! -d .venv ] || [ ! -d kafka ]; then
+  printf "Set up your environment first:\n$ ./manager setup\n"
+  return
+fi
 
-# TODO: here more tools like debug sessions or so
+notools() {
+  deactivate
+  unalias manager
+  unset -f notools
+}
+
+source .venv/bin/activate
+printf "Type notools in your terminal quit from devtools\n"
+
+alias manager=$(realpath ./manager)
+# TODO: make more command helpers
