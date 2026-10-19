@@ -11,35 +11,58 @@ if [[ $BASH_SOURCE == ${0} ]]; then
 fi
 
 if [[ $BASH_SOURCE == */* ]]; then
-  PROJECT_DIR="$(realpath ${BASH_SOURCE%/*})"
+  PROJECT_DIR="$(realpath "${BASH_SOURCE%/*}")"
 else
   PROJECT_DIR="$(realpath .)"
 fi
 
+KAFKA_VERSION="${KAFKA_VERSION:-4.3.1}"
+WM_KAFKA="${WM_KAFKA:-localhost:9092}" # broker used by the wm_* helpers
+WM_PORT="${WM_PORT:-5000}"             # CENTRAL socket port used by the wm_* helpers
+
 echo "Type 'h' in your terminal to see available devtools"
 usage_message=$(
-  cat <<EOF
+  cat <<EOT
 Commands:
   h                 - Print this help message
   notools           - Unload devtools
   manager <option>  - Manage this project's development environment
     <option>:
-      build  - Build the container
-      reset  - Reset py virtual environment and kafka installation
-EOF
+      build              - Build the container (image 'wm')
+      run <module> [...] - Run a module in the container (host network), e.g. manager run WM_FO localhost:9092 FO-01
+      setup              - Create the py virtual environment and download kafka
+      reset              - Reset py virtual environment and kafka installation
+  kafka <option>    - Local Kafka broker (needs Java 17+)
+    <option>:  start | stop | topics | clean
+  Run modules locally (broker: \$WM_KAFKA, central port: \$WM_PORT):
+  wm_central                         - CENTRAL (panel at http://localhost:8080)
+  wm_ws <id> [name] [x] [y]          - Monitor (background, log in .log/) + Engine (foreground menu)
+  wm_monitor <id> [name] [x] [y]     - Monitor only (port 6000+id)
+  wm_engine <id>                     - Engine only (connects to monitor port 6000+id)
+  wm_fo <operator_id> [file]         - Field Operator, e.g. wm_fo FO-01 services.txt
+EOT
 )
 
 h() {
-  printf "$usage_message\n"
+  printf "%s\n" "$usage_message"
 }
 
 manager() {
+  local option="$1"
+  shift
   local DIR
   DIR=$(pwd)
-  cd $PROJECT_DIR
+  cd "$PROJECT_DIR" || return 1
 
-  case "$1" in
+  case "$option" in
   build) docker build -t wm . ;;
+  run)
+    if [ $# -lt 1 ]; then
+      echo "manager: usage: manager run <WM_Central|WM_FO|WM_WS_E|WM_WS_M> [args...]"
+    else
+      docker run --rm -it --network host wm "$@"
+    fi
+    ;;
   setup)
     if [ ! -d .venv ]; then
       echo "manager: Making virtual environment..."
@@ -51,17 +74,21 @@ manager() {
     fi
 
     if [ ! -d kafka ]; then
-      echo "manager: Downloading kafka..."
-      curl https://dlcdn.apache.org/kafka/4.3.1/kafka-4.3.1-src.tgz >kafka.tgz
-      tar -xf kafka.tgz
-      rm kafka.tgz
-      ls
-      rename 's/kafka.*/kafka/' kafka*
+      echo "manager: Downloading kafka ${KAFKA_VERSION}..."
+      # archive.apache.org keeps every release (dlcdn only keeps the latest ones)
+      if curl -fL "https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz" -o kafka.tgz; then
+        mkdir kafka
+        tar -xzf kafka.tgz -C kafka --strip-components=1
+      else
+        echo "manager: kafka download failed (check KAFKA_VERSION=${KAFKA_VERSION})"
+      fi
+      rm -f kafka.tgz
     else
       echo "manager: kafka binaries ready"
     fi
     ;;
   reset)
+    kafka stop 2>/dev/null
     rm -rf .venv kafka
     manager setup
     ;;
@@ -70,21 +97,100 @@ manager() {
     ;;
   esac
 
-  cd $DIR
+  cd "$DIR" || return 1
+}
+
+kafka() {
+  local K="$PROJECT_DIR/kafka"
+  local CONF="$K/config/wm.properties"
+  local DATA="$PROJECT_DIR/.kafka-data"
+
+  case "$1" in
+  start)
+    if [ ! -d "$K" ]; then
+      echo "kafka: not installed, run: manager setup"
+      return 1
+    fi
+    if ! command -v java >/dev/null; then
+      echo "kafka: Java 17+ is required (e.g. sudo apt install openjdk-17-jre-headless)"
+      return 1
+    fi
+    # same as the default KRaft config, but with the data inside the project
+    if [ ! -f "$CONF" ]; then
+      sed "s|^log.dirs=.*|log.dirs=$DATA|" "$K/config/server.properties" >"$CONF"
+    fi
+    if [ ! -d "$DATA" ]; then
+      "$K/bin/kafka-storage.sh" format --standalone -t "$("$K/bin/kafka-storage.sh" random-uuid)" -c "$CONF"
+    fi
+    "$K/bin/kafka-server-start.sh" -daemon "$CONF"
+    echo "kafka: starting on localhost:9092 (logs in kafka/logs/server.log)"
+    ;;
+  stop)
+    "$K/bin/kafka-server-stop.sh" 2>/dev/null && echo "kafka: stopped"
+    ;;
+  topics)
+    "$K/bin/kafka-topics.sh" --bootstrap-server "$WM_KAFKA" --list
+    ;;
+  clean)
+    kafka stop
+    sleep 2
+    rm -rf "$DATA"
+    echo "kafka: data removed"
+    ;;
+  *)
+    echo "kafka: usage: kafka <start|stop|topics|clean>"
+    ;;
+  esac
+}
+
+# --- run the modules locally (inside the virtual environment) -----------------
+wm_central() {
+  (cd "$PROJECT_DIR" && WM_VOLUME="${WM_VOLUME:-$PROJECT_DIR/.log}" python3 WM.py WM_Central "$WM_PORT" "$WM_KAFKA")
+}
+
+wm_monitor() {
+  local id=${1:?usage: wm_monitor <id> [name] [x] [y]}
+  shift
+  (cd "$PROJECT_DIR" && python3 WM.py WM_WS_M $((6000 + id)) "localhost:$WM_PORT" "$id" "$@")
+}
+
+wm_engine() {
+  local id=${1:?usage: wm_engine <id>}
+  (cd "$PROJECT_DIR" && python3 WM.py WM_WS_E "$WM_KAFKA" "localhost:$((6000 + id))")
+}
+
+wm_ws() {
+  local id=${1:?usage: wm_ws <id> [name] [x] [y]}
+  shift
+  mkdir -p "$PROJECT_DIR/.log"
+  (cd "$PROJECT_DIR" && exec python3 WM.py WM_WS_M $((6000 + id)) "localhost:$WM_PORT" "$id" "$@") \
+    >>"$PROJECT_DIR/.log/ws${id}_monitor.log" 2>&1 &
+  local monitor_pid=$!
+  echo "wm_ws: monitor running in background (pid $monitor_pid, log: .log/ws${id}_monitor.log)"
+  wm_engine "$id"
+  kill "$monitor_pid" 2>/dev/null
+}
+
+wm_fo() {
+  local operator=${1:?usage: wm_fo <operator_id> [requests_file]}
+  shift
+  (cd "$PROJECT_DIR" && python3 WM.py WM_FO "$WM_KAFKA" "$operator" "$@")
 }
 
 notools() {
-  deactivate
+  deactivate 2>/dev/null
   unset usage_message
-  unset PROJECT_DIR
+  unset PROJECT_DIR KAFKA_VERSION WM_KAFKA WM_PORT
 
   unset -f notools
   unset -f manager
+  unset -f kafka
+  unset -f wm_central wm_monitor wm_engine wm_ws wm_fo
   unset -f h
 }
 
-if [ ! -d .venv ] || [ ! -d kafka ]; then
+if [ ! -d "$PROJECT_DIR/.venv" ] || [ ! -d "$PROJECT_DIR/kafka" ]; then
   manager setup
 fi
 
-source .venv/bin/activate
+source "$PROJECT_DIR/.venv/bin/activate"

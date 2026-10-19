@@ -1,3 +1,1 @@
-flask
-confluent-kafka
-flet
+confluent-kafka>=2.5
