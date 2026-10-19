@@ -220,3 +220,4 @@ __marimo__/
 kafka/
 /.vs/UA_SD/FileContentIndex
 .vs/
+.kafka-data/

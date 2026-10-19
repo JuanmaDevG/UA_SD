@@ -1,7 +1,12 @@
 .git/
 .gitignore
 .log/
+.venv/
+.kafka-data/
+kafka/
 __pycache__/
+*.pyc
+*.db
 nombres.txt
 prompts/
 README.md
