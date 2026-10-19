@@ -4,6 +4,7 @@
 - <STX><DATA><ETX><LRC> socket framing (with ENQ/ACK/NACK/EOT handshake)
 - A small Kafka wrapper (JSON producer + background JSON consumers)
 """
+
 import json
 import socket
 import sys
@@ -12,8 +13,13 @@ import time
 import traceback
 import uuid
 
-from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
-from confluent_kafka.admin import AdminClient, NewTopic
+from typing import Callable
+from concurrent.futures import Future
+
+from confluent_kafka import \
+    Consumer, KafkaError, KafkaException, Producer, Message
+from confluent_kafka.admin import AdminClient
+from confluent_kafka.cimpl import NewTopic
 
 # --------------------------------------------------------------------------
 # Domain constants
@@ -43,7 +49,7 @@ TOPICS = [T_REQUESTS, T_WS_CMD, T_WS_EVENTS, T_FO_NOTIFY, T_STATE]
 DEFAULT_DURATION = 20  # seconds, when a request does not specify one
 
 
-def ws_name(ws_id) -> str:
+def ws_name(ws_id: int) -> str:
     return f"WS-{int(ws_id):02d}"
 
 
@@ -85,13 +91,13 @@ class Channel:
     """
 
     def __init__(self, sock: socket.socket, timeout: float = 5.0):
-        self.sock = sock
+        self.sock: socket.socket = sock
         self.sock.settimeout(timeout)
         try:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        self._buf = b""
+        self._buf: bytes = b""
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -179,7 +185,7 @@ class Channel:
 # --------------------------------------------------------------------------
 # Kafka
 # --------------------------------------------------------------------------
-def _on_delivery(err, msg):
+def _on_delivery(err: KafkaError | None, msg: Message):
     if err is not None:
         print(f"[kafka] delivery failed on {msg.topic()}: {err}", file=sys.stderr, flush=True)
 
@@ -188,28 +194,30 @@ class Bus:
     """JSON producer + JSON consumers over Kafka."""
 
     def __init__(self, bootstrap: str, client: str = "wm"):
-        self.bootstrap = bootstrap
-        self.producer = Producer({"bootstrap.servers": bootstrap, "client.id": client})
+        self.bootstrap: str = bootstrap
+        self.producer: Producer = Producer({"bootstrap.servers": bootstrap, "client.id": client})
 
-    def publish(self, topic: str, payload: dict, key=None):
+    def publish(self, topic: str, payload: dict[object, object], key: str | None =None):
         data = json.dumps(payload).encode("utf-8")
         key_bytes = None if key is None else str(key).encode("utf-8")
         while True:
             try:
-                self.producer.produce(topic, data, key=key_bytes, on_delivery=_on_delivery)
+                self.producer.produce(
+                    topic, data, key=key_bytes, on_delivery=_on_delivery
+                )
                 break
             except BufferError:
-                self.producer.poll(0.1)
-        self.producer.poll(0)
+                _ = self.producer.poll(0.1)
+        _ = self.producer.poll(0)
 
     def flush(self, timeout: float = 5.0):
-        self.producer.flush(timeout)
+        _ = self.producer.flush(timeout)
 
     def ensure_topics(self):
         """Create the topics if missing (brokers may have auto-create disabled)."""
         try:
             admin = AdminClient({"bootstrap.servers": self.bootstrap})
-            futures = admin.create_topics(
+            futures: dict[str, Future[None]] = admin.create_topics(
                 [NewTopic(t, num_partitions=1, replication_factor=1) for t in TOPICS],
                 request_timeout=10,
             )
@@ -222,7 +230,10 @@ class Bus:
         except Exception as exc:  # broker unreachable, etc.
             print(f"[kafka] ensure_topics failed: {exc}", file=sys.stderr, flush=True)
 
-    def listen(self, topics, handler, stop: threading.Event, role: str = "wm") -> threading.Event:
+    def listen(
+        self, topics: list[str], handler: Callable[str, dict],
+            stop: threading.Event, role: str = "wm"
+    ) -> threading.Event:
         """Start a daemon thread that calls handler(topic, payload_dict) for every message.
 
         Every listener gets its own consumer group and starts at the END of the

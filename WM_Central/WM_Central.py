@@ -13,7 +13,9 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from wm_common import *  # noqa: F401,F403
+import random
+
+from wm_common import *
 
 USAGE_MSG = '''
 Usage:
@@ -55,7 +57,7 @@ REASON_ES = {
 }
 
 
-def status_of(st: dict) -> str:
+def status_of(st: dict[object, object]) -> str:
     if not st["connected"] or st["health"] == "WAIT":
         return DISCONNECTED
     if st["health"] == "KO":
@@ -69,16 +71,17 @@ def status_of(st: dict) -> str:
 
 class Central:
     def __init__(self, port: int, bootstrap: str):
-        self.port = port
-        self.bootstrap = bootstrap
-        self.bus = Bus(bootstrap, "wm-central")
-        self.stop = threading.Event()
-        self.lock = threading.RLock()       # protects self.stations
-        self.dblock = threading.Lock()      # protects the sqlite connection
-        self.stations: dict[int, dict] = {}
-        self.messages = deque(maxlen=200)
-        self.started = time.time()
-        self.srv = None
+        self.port: int = port
+        self.bootstrap: str = bootstrap
+        self.bus: Bus = Bus(bootstrap, "wm-central")
+        self.stop: threading.Event = threading.Event()
+        self.lock: threading.RLock = threading.RLock()       # protects self.stations
+        self.dblock: threading.Lock = threading.Lock()      # protects the sqlite connection
+        self.stations: dict[int, dict[object, object]] = {}
+        self.messages: deque[object] = deque(maxlen=200)
+        self.started: float = time.time()
+        self.srv: socket.socket | None = None
+        self.db: sqlite3.Connection
 
     # ------------------------------------------------------------------ logging
     def log(self, text: str):
@@ -91,13 +94,16 @@ class Central:
         folder = os.environ.get("WM_VOLUME", ".")
         os.makedirs(folder, exist_ok=True)
         self.db = sqlite3.connect(os.path.join(folder, "wm.db"), check_same_thread=False)
-        self.db.executescript(DB_SCHEMA)
+        _ = self.db.executescript(DB_SCHEMA)
         extra = [o.strip() for o in os.environ.get("WM_OPERATORS", "").split(",") if o.strip()]
         for op in [f"FO-{i:02d}" for i in range(1, 6)] + extra:
-            self.db.execute("INSERT OR IGNORE INTO operators(id, name) VALUES (?, ?)", (op, op))
+            _ = self.db.execute(
+                "INSERT OR IGNORE INTO operators(id, name, x, y) VALUES (?, ?, ?, ?)",
+                (op, op, random.uniform(0, 1), random.uniform(0, 1))
+            )
         self.db.commit()
 
-    def sql(self, query: str, args: tuple = ()):
+    def sql(self, query: str, args: tuple[object, ...] = ()):
         with self.dblock:
             rows = self.db.execute(query, args).fetchall()
             self.db.commit()
@@ -461,7 +467,6 @@ class Central:
         threading.Thread(target=httpd.serve_forever, daemon=True, name="http").start()
         self.log(f"CENTRAL: panel web en el puerto {port}")
 
-    # ------------------------------------------------------------------ main
     def run(self):
         self.db_init()
         self.load_stations()
