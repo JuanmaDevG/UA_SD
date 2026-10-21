@@ -152,20 +152,22 @@ def monitor(*args: str):
 # ENGINE
 # ==========================================================================
 class Engine:
-    def __init__(self, kafka: str, monitor_addr: tuple):
-        self.bus = Bus(kafka, "wm-ws-engine")
-        self.monitor_addr = monitor_addr
-        self.stop = threading.Event()
-        self.lock = threading.RLock()
-        self.ws_id = None
-        self.linked = threading.Event()   # set while the Monitor link is up
-        self.ko = False                   # simulated leak
-        self.blocked = False              # Fuera de Servicio, ordered by CENTRAL
-        self.watering = False
-        self.req_id = self.fo_id = None
-        self.duration = 0
-        self.t0 = 0.0
-        self.flow = self.volume = 0.0
+    def __init__(self, kafka: str, monitor_addr: tuple[str, int]):
+        self.bus: Bus = Bus(kafka, "wm-ws-engine")
+        self.monitor_addr: tuple[str, int] = monitor_addr
+        self.stop: threading.Event = threading.Event()
+        self.lock: threading.RLock = threading.RLock()
+        self.ws_id: int | None  = None
+        self.linked: threading.Event = threading.Event()   # set while the Monitor link is up
+        self.ko: bool = False                   # simulated leak
+        self.blocked: bool = False              # Fuera de Servicio, ordered by CENTRAL
+        self.watering: bool = False
+        self.fo_id: int | None = None
+        self.req_id: int | None = None
+        self.duration: int = 0
+        self.flow: float = 0.0
+        self.volume: float = 0.0
+        self.t0: float = 0.0
 
     def say(self, text: str):
         print(f"[{stamp()}] ENGINE {ws_name(self.ws_id) if self.ws_id is not None else '(sin ID)'}: {text}", flush=True)
@@ -181,7 +183,7 @@ class Engine:
             return WATERING
         return AVAILABLE
 
-    def event(self, kind: str, **fields):
+    def event(self, kind: str, **fields: dict[object, object]):
         self.bus.publish(T_WS_EVENTS, {"type": kind, "ws_id": self.ws_id, **fields}, key=self.ws_id)
 
     # -- Monitor link ---------------------------------------------------------
@@ -217,10 +219,10 @@ class Engine:
                     self.finish("DISCONNECTED")
                 if ch:
                     ch.close()
-            self.stop.wait(2)
+            _ = self.stop.wait(2)
 
     # -- commands from CENTRAL ------------------------------------------------
-    def on_cmd(self, topic: str, m: dict):
+    def on_cmd(self, m: dict[str, object]):
         if self.ws_id is None or m.get("ws_id") != self.ws_id:
             return
         kind = m.get("type")
@@ -240,7 +242,7 @@ class Engine:
         elif kind == "INFO":
             self.say(f"CENTRAL: {m.get('text')}")
 
-    def start(self, m: dict):
+    def start(self, m: dict[str, object]):
         with self.lock:
             reason = None
             if not self.linked.is_set():
@@ -264,7 +266,7 @@ class Engine:
         self.say(f"electroválvula ABIERTA (operario {self.fo_id}, límite {self.duration} s)")
         self.event("STARTED", req_id=m.get("req_id"), fo_id=self.fo_id)
 
-    def finish(self, reason: str):
+    def finish(self, reason: str | object):
         with self.lock:
             if not self.watering:
                 return
@@ -331,12 +333,15 @@ class Engine:
     def run(self):
         self.bus.ensure_topics()
         ready = self.bus.listen([T_WS_CMD], self.on_cmd, self.stop, "ws-engine")
-        wait_ready(ready)
+        _ = wait_ready(ready)
         threading.Thread(target=self.link_loop, daemon=True).start()
         threading.Thread(target=self.ticker, daemon=True).start()
         threading.Thread(target=self.menu, daemon=True).start()
-        signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
-        signal.signal(signal.SIGINT, lambda *_: self.stop.set())
+
+        def _setstop(*_: object):
+            self.stop.set()
+        _ = signal.signal(signal.SIGTERM, _setstop)
+        _ = signal.signal(signal.SIGINT, _setstop)
         while not self.stop.wait(1):
             pass
         self.finish("STOPPED")

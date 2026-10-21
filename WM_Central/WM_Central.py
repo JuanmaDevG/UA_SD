@@ -80,7 +80,7 @@ class Central:
         self.stations: dict[int, dict[object, object]] = {}
         self.messages: deque[object] = deque(maxlen=200)
         self.started: float = time.time()
-        self.srv: socket.socket | None = None
+        self.srv: socket.socket = None
         self.db: sqlite3.Connection
 
     # ------------------------------------------------------------------ logging
