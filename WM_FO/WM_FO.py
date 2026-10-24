@@ -149,11 +149,15 @@ class FieldOperator:
         self.bus.flush()
 
 
-def main(*args: str):
+if __name__ == "__main__":
+    if len(sys.argv) not in [3, 4] or sys.argv[1].find(':') == -1:
+        print(USAGE_MSG)
+        exit(1)
     try:
-        host, port = parse_hostport(args[0])
-        fo_id = args[1]
+        host, port = parse_hostport(sys.argv[1])
+        fo_id = sys.argv[2]
     except (IndexError, ValueError):
         print(USAGE_MSG)
-        return 1
-    FieldOperator(f"{host}:{port}", fo_id).run(args[2] if len(args) > 2 else None)
+        exit(1)
+    FieldOperator(f"{host}:{port}", fo_id) \
+        .run(sys.argv[3] if len(sys.argv) == 4 else None)

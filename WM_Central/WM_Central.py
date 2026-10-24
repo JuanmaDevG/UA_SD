@@ -99,7 +99,7 @@ class Central:
         for op in [f"FO-{i:02d}" for i in range(1, 6)] + extra:
             _ = self.db.execute(
                 "INSERT OR IGNORE INTO operators(id, name) VALUES (?, ?)",
-                (op, op, random.uniform(0, 1), random.uniform(0, 1))
+                (op, op)
             )
         self.db.commit()
 
@@ -498,7 +498,7 @@ def main(*args: str):
     kafka = args[1] if len(args) > 1 else os.environ.get("WM_KAFKA", "")
     if not port.isdigit() or not kafka:
         print(USAGE_MSG)
-        return 1
+        return
     host, kport = parse_hostport(kafka)
     Central(int(port), f"{host}:{kport}").run()
 
@@ -574,3 +574,6 @@ async function refresh(){
 refresh(); setInterval(refresh,1000);
 </script></body></html>
 '''
+
+if __name__ == "__main__":
+    main(*sys.argv)
