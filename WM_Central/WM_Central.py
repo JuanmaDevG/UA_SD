@@ -98,7 +98,7 @@ class Central:
         extra = [o.strip() for o in os.environ.get("WM_OPERATORS", "").split(",") if o.strip()]
         for op in [f"FO-{i:02d}" for i in range(1, 6)] + extra:
             _ = self.db.execute(
-                "INSERT OR IGNORE INTO operators(id, name, x, y) VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO operators(id, name) VALUES (?, ?)",
                 (op, op, random.uniform(0, 1), random.uniform(0, 1))
             )
         self.db.commit()

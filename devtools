@@ -26,7 +26,7 @@ usage_message=$(
 Commands:
   h                 - Print this help message
   notools           - Unload devtools
-  manager <option>  - Manage this project's development environment
+  manager <option>  - Manage this project development environment
     <option>:
       build              - Build the container (image 'wm')
       run <module> [...] - Run a module in the container (host network), e.g. manager run WM_FO localhost:9092 FO-01
