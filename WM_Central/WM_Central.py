@@ -3,6 +3,18 @@
 (Later a proper description)
 """
 
+import os
+from pathlib import Path
+from queue import Queue
+
+import socket
+import sqlite3
+import sys
+import threading
+import time
+from types import SimpleNamespace
+
+
 USAGE_MSG = """
 Usage:
     WM_Central <login_port> <kafka_host>:<kafka_port>
@@ -29,32 +41,31 @@ CREATE TABLE IF NOT EXISTS operators (
 );
 """
 
-QUERY_ALL = "SELECT * FROM %s;"
-
-import os
-from pathlib import Path
-import socket
-import sqlite3
-import sys
-import threading
-import time
-
-from queue import Queue
-from types import SimpleNamespace
-
 
 def stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
-# System message status
+# System message coloring
 OK = "\033[1;32m"
 WARNING = "\033[1;33m"
 ERROR = "\033[1;31m"
 
 
-# System instructions
+# General instructions
 EXIT = 0x00
+STX = 0x01
+ETX = 0x02
+NACK = 0x03
+ACK = 0x04
+
+
+# Login server instructions
+ST_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
+ST_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
+
+
+# Kafka instructions
 # ...
 
 
@@ -119,21 +130,108 @@ def load_entities(
 
     def extract(tbname: str) -> dict[int, SimpleNamespace]:
         return {
-            r["id"]: SimpleNamespace(**r) for r in db.execute(QUERY_ALL.format(tbname))
+            r["id"]: SimpleNamespace(**r) for r in db.execute(f"SELECT * FROM {tbname}")
         }
 
     return extract("stations"), extract("operators")
 
 
-# login_server helpers
+def st_login(
+    data: bytes, stations: dict[int, SimpleNamespace], st_event: threading.Event
+) -> int:
+    res = ACK
+    tell(
+        OK,
+        f"(login server) peticion de LOGIN con id={data[1]} de {addr}",
+    )
+    st_event.wait()
+    st_event.clear()
+    if int(data[1]) not in stations:
+        res = NACK
+    st_event.set()
+    if res == NACK:
+        tell(
+            ERROR,
+            f"(login server) el id={data[1]} no existe, debe registrarse...",
+        )
+    return res
 
 
-def login_server(stations: dict[int, SimpleNamespace]) -> None:
+def st_register(
+    data: bytes, stations: dict[int, SimpleNamespace], st_event: threading.Event
+) -> int:
+    res = ACK
+    exists = False
+    st_event.wait()
+    st_event.clear()
+    if (id := data[1]) in stations:
+        exists = True
+    st_event.set()
+
+    tell(OK, f"(login server) comando REGISTER con id={id}")
+    if exists:
+        tell(
+            WARNING,
+            f"(login server) el id={id} ya estaba registrado, actualizando datos...",
+        )
+
+    if data[4] == STX and (name_end := data.find(ETX, 5)) != -1:
+        name: str = data[3 : name_end + 1].decode("utf-8")
+        state = int(data[name_end + 2])
+        st_event.wait()
+        st_event.clear()
+        stations[id] = SimpleNamespace(
+            id=id,
+            name=name,
+            state=state,
+            x=data[2] / 255,
+            y=data[3] / 255,
+        )
+        st_event.set()
+    else:
+        res = NACK
+        tell(
+            ERROR,
+            f"(login server) registro para id={id} formato incorrecto de argumentos"
+            ", falta STX y/o ETX en el campo <name>",
+        )
+
+    return res
+
+
+def login_server(
+    login_port: int,
+    stations: dict[int, SimpleNamespace],
+    st_event: threading.Event,
+    watchdog_queue: Queue,
+) -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", login_port))
+    srv.listen(5)
+    instructions = {ST_LOGIN: st_login, ST_REGISTER: st_register}
+    response = bytearray([ACK])
     try:
         while True:
-            pass
+            conn, addr = srv.accept()
+            tell(OK, f"(login server) {addr} se ha conectado")
+            with conn:
+                data = conn.recv(512)
+                if int(data[0]) not in instructions:
+                    tell(
+                        ERROR,
+                        f"(login server) {addr} ha enviado una instruccion desconocida",
+                    )
+                    srv.sendall(bytes([NACK]))
+                    continue
+                response[0] = instructions[data[0]](data, stations, st_event)
+                conn.sendall(response)
+                if response[0] == ACK:
+                    watchdog_queue.put(data)
     except (KeyboardInterrupt, SystemExit):
-        pass  # TODO: write changes of the queue
+        pass
+    finally:
+        srv.close()
 
 
 def watchdog(db: sqlite3.Connection, q: Queue[bytes]) -> None:
@@ -152,7 +250,7 @@ def watchdog(db: sqlite3.Connection, q: Queue[bytes]) -> None:
             # TODO: apply instruction to cursor
 
             if time.monotonic() - start >= 5.0:
-                tell(OK, "watchdog writing to database")
+                tell(OK, "(watchdog) writing to database")
                 db.commit()
                 start = time.monotonic()
                 changes.execute("BEGIN")
@@ -199,12 +297,16 @@ def main(*args):
         f"Se han precargado {len(stations)} estaciones y {len(operators)} operadores",
     )
 
-    threading.Thread(
-        target=login_server, name="wm-login", args=(stations), daemon=True
-    ).run()
-
+    st_event = threading.Event()
+    st_event.set()
     watchdog_queue = Queue()
-    # login thread
+    threading.Thread(
+        target=login_server,
+        name="wm-login",
+        args=(login_port, stations, st_event, watchdog_queue),
+        daemon=True,
+    ).start()
+
     # kafka thread
 
 
