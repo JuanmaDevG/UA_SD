@@ -78,7 +78,10 @@ def tell(mtype: str, msg: str):
     )
 
 
-def get_netparams(args: tuple[str, str]) -> tuple[int, str]:
+def get_netparams(args: tuple[str, ...]) -> tuple[int, str]:
+    if len(args) == 0:
+        print(USAGE_MSG)
+        sys.exit(1)
     login_port: int
     kafka: str
     if len(args) == 1 and args[0] == "here":
@@ -87,14 +90,14 @@ def get_netparams(args: tuple[str, str]) -> tuple[int, str]:
     elif (
         len(args) == 2
         and args[0].isnumeric()
-        and (l := args[1].find(":")) != -1
+        and (l := args[1].find(":")) not in (-1, 0, len(args[1]) - 1)
         and args[1][l + 1 :].isnumeric()
     ):
         login_port = int(args[0])
         kafka = args[1]
     else:
         print(USAGE_MSG)
-        sys.exit()
+        sys.exit(1)
 
     return login_port, kafka
 
@@ -142,7 +145,7 @@ def st_login(
     res = ACK
     tell(
         OK,
-        f"(login server) peticion de LOGIN con id={data[1]} de {addr}",
+        f"(login server) peticion de LOGIN con id={data[1]}",
     )
     st_event.wait()
     st_event.clear()

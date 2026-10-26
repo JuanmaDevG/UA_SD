@@ -1,0 +1,11 @@
+{
+  "include": [
+    "WM_Central",
+    "WM_FO",
+    "WM_WS"],
+  "extraPaths": [
+    "WM_Central",
+    "WM_FO",
+    "WM_WS"],
+  "exclude": ["**/__pycache__"]
+}
