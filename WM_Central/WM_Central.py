@@ -203,12 +203,12 @@ def login_server(
     login_port: int,
     stations: dict[int, SimpleNamespace],
     st_event: threading.Event,
-    watchdog_queue: Queue,
+    watchdog_queue: Queue[bytes],
 ) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", login_port))
-    srv.listen(5)
+    srv.listen(10)
     instructions = {ST_LOGIN: st_login, ST_REGISTER: st_register}
     response = bytearray([ACK])
     try:
@@ -262,16 +262,14 @@ def watchdog(db: sqlite3.Connection, q: Queue[bytes]) -> None:
         db.close()
 
 
-# kafka_server helpers
-
-
-def kafka_server(
+def run_kafka(
+    kafka: str,
     stations: dict[int, SimpleNamespace],
     operators: dict[int, SimpleNamespace],
-    watchdog_queue: Queue,
+    watchdog_queue: Queue[bytes],
 ) -> None:
     # Consumer + Producer
-    # Make instructions
+    # Answer to events and instructions
     pass
 
 
@@ -297,6 +295,7 @@ def main(*args):
         f"Se han precargado {len(stations)} estaciones y {len(operators)} operadores",
     )
 
+    # TODO: change the st_event with a threading.Lock
     st_event = threading.Event()
     st_event.set()
     watchdog_queue = Queue()
@@ -307,7 +306,14 @@ def main(*args):
         daemon=True,
     ).start()
 
-    # kafka thread
+    threading.Thread(
+        target=watchdog,
+        name="wm-dbwatchdog",
+        args=(db, watchdog_queue),
+        daemon=True,
+    ).start()
+
+    run_kafka(kafka, stations, operators, watchdog_queue)
 
 
 if __name__ == "__main__":
