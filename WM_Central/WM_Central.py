@@ -63,6 +63,7 @@ ACK = 0x04
 # Login server instructions
 ST_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
 ST_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
+ST_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
 
 
 # Kafka instructions
@@ -119,9 +120,7 @@ def getdb() -> sqlite3.Connection:
     return db
 
 
-def load_entities(
-    db: sqlite3.Connection,
-) -> tuple[dict[int, SimpleNamespace], ...]:
+def load_entities(db: sqlite3.Connection) -> tuple[dict[int, SimpleNamespace], ...]:
     """Load entities dictionaries
     Args:
         db: database connection
@@ -140,18 +139,17 @@ def load_entities(
 
 
 def st_login(
-    data: bytes, stations: dict[int, SimpleNamespace], st_event: threading.Event
+    data: bytes, stations: dict[int, SimpleNamespace], st_lock: threading.Lock
 ) -> int:
     res = ACK
     tell(
         OK,
         f"(login server) peticion de LOGIN con id={data[1]}",
     )
-    st_event.wait()
-    st_event.clear()
+    st_lock.acquire()
     if int(data[1]) not in stations:
         res = NACK
-    st_event.set()
+    st_lock.release()
     if res == NACK:
         tell(
             ERROR,
@@ -161,15 +159,14 @@ def st_login(
 
 
 def st_register(
-    data: bytes, stations: dict[int, SimpleNamespace], st_event: threading.Event
+    data: bytes, stations: dict[int, SimpleNamespace], st_lock: threading.Lock
 ) -> int:
     res = ACK
     exists = False
-    st_event.wait()
-    st_event.clear()
+    st_lock.acquire()
     if (id := data[1]) in stations:
         exists = True
-    st_event.set()
+    st_lock.release()
 
     tell(OK, f"(login server) comando REGISTER con id={id}")
     if exists:
@@ -181,8 +178,7 @@ def st_register(
     if data[4] == STX and (name_end := data.find(ETX, 5)) != -1:
         name: str = data[3 : name_end + 1].decode("utf-8")
         state = int(data[name_end + 2])
-        st_event.wait()
-        st_event.clear()
+        st_lock.acquire()
         stations[id] = SimpleNamespace(
             id=id,
             name=name,
@@ -190,7 +186,7 @@ def st_register(
             x=data[2] / 255,
             y=data[3] / 255,
         )
-        st_event.set()
+        st_lock.release()
     else:
         res = NACK
         tell(
@@ -205,7 +201,7 @@ def st_register(
 def login_server(
     login_port: int,
     stations: dict[int, SimpleNamespace],
-    st_event: threading.Event,
+    st_lock: threading.Lock,
     watchdog_queue: Queue[bytes],
 ) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -227,7 +223,7 @@ def login_server(
                     )
                     srv.sendall(bytes([NACK]))
                     continue
-                response[0] = instructions[data[0]](data, stations, st_event)
+                response[0] = instructions[data[0]](data, stations, st_lock)
                 conn.sendall(response)
                 if response[0] == ACK:
                     watchdog_queue.put(data)
@@ -247,14 +243,15 @@ def watchdog(db: sqlite3.Connection, q: Queue[bytes]) -> None:
         start = time.monotonic()
         while True:
             v = q.get()
-            if v[0] == 0:
+            if v[0] == EXIT:
                 break
 
             # TODO: apply instruction to cursor
 
             if time.monotonic() - start >= 5.0:
-                tell(OK, "(watchdog) writing to database")
+                tell(OK, "(watchdog) updating database...")
                 db.commit()
+                tell(OK, "(watchdog) database updated")
                 start = time.monotonic()
                 changes.execute("BEGIN")
 
@@ -298,14 +295,13 @@ def main(*args):
         f"Se han precargado {len(stations)} estaciones y {len(operators)} operadores",
     )
 
-    # TODO: change the st_event with a threading.Lock
-    st_event = threading.Event()
-    st_event.set()
+    # TODO: change the st_lock with a threading.Lock
+    st_lock = threading.Lock()
     watchdog_queue = Queue()
     threading.Thread(
         target=login_server,
         name="wm-login",
-        args=(login_port, stations, st_event, watchdog_queue),
+        args=(login_port, stations, st_lock, watchdog_queue),
         daemon=True,
     ).start()
 
@@ -320,4 +316,4 @@ def main(*args):
 
 
 if __name__ == "__main__":
-    main(*(sys.argv[1:]))
+    main(*sys.argv[1:])
