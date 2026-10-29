@@ -298,9 +298,13 @@ def main(*args):
         f"Se han precargado {len(stations)} estaciones y {len(operators)} operadores",
     )
 
+<<<<<<< Updated upstream
     # TODO: change the st_event with a threading.Lock
     st_event = threading.Event()
     st_event.set()
+=======
+    st_lock = threading.Lock()
+>>>>>>> Stashed changes
     watchdog_queue = Queue()
     threading.Thread(
         target=login_server,
