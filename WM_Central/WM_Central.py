@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import threading
 import time
+from random import uniform
 from types import SimpleNamespace
 
 
@@ -40,6 +41,8 @@ CREATE TABLE IF NOT EXISTS operators (
     name TEXT
 );
 """
+
+FIELD_OPERATORS = ["Jeffrey", "Donald", "Charlie", "Kanye"]
 
 
 def stamp() -> str:
@@ -115,7 +118,15 @@ def getdb() -> sqlite3.Connection:
     db_loc.mkdir(0o700, parents=True, exist_ok=True)
     db_loc /= "ws.db"
     db = sqlite3.Connection(db_loc)
-    db.executescript(DB_SCHEMA)
+    db.executescript(
+        DB_SCHEMA
+        + "INSERT OR IGNORE INTO operators (id, x, y, name) VALUES "
+            + ",".join([str(
+                (i, round(uniform(0,1), 2),round(uniform(0,1), 2), name))
+                for i, name in enumerate(FIELD_OPERATORS, start=1)
+            ])
+        + ";"
+    );
 
     return db
 
