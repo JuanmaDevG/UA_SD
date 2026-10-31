@@ -4,7 +4,6 @@
 """
 
 import os
-from pathlib import Path
 from queue import Queue
 from confluent_kafka import Consumer, KafkaException, KafkaError, Producer
 
@@ -14,6 +13,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+from math import integer
+
 EXIT = 0x00
 STX = 0x01
 ETX = 0x02
@@ -21,6 +22,9 @@ NACK = 0x03
 ACK = 0x04
 
 FO_WATER = 0x08 # bytes[0x08, id_ws(1 byte)]
+
+#Producer queue
+producer_queue = Queue()
 
 
 USAGE_MSG = """
@@ -57,19 +61,41 @@ def delivery_report(err, msg):
     if err is not None:
         print(f"Message delivery failed: {err}")
 
-def run_kafka(kafka):
-    producer = Producer({'Puerto Kafka': kafka})
+def kafka_producer(producer):
 
-    #Cambiar el while True por la comprobación de que se haya pulsado el botón de comenzar riego
     while True:
-        #Cambiar el value por los bytes de arriba
-        producer.produce('Watering', value = 'Hola', callback=delivery_report)
-        producer.poll(0)
+        item = producer_queue.get()
+
+        if item is None:
+            break
+
+        topic, message = item
+        try:
+            producer.produce(topic, value= message)
+        except Exception as error:
+            print(f"Error al enviar mensaje: {error}")
+
+        producer_queue.task_done()
+
+
+def send_instruction(id_estacion):
+    message = bytes([0x08, id_estacion.to_bytes()])
+    producer_queue.put(message)
+    
 
 def main(*args):
     kafka = get_netparams(args)
 
-    run_kafka(kafka)
+    producer = Producer({'Puerto Kafka': kafka})
+
+    lock=threading.Lock()
+
+    threading.Thread(
+        target=kafka_producer,
+        name='ws-watering',
+        args=(producer, producer_queue, lock),
+        daemon=True
+    ).start()
 
 
 if __name__ == "__main__":
