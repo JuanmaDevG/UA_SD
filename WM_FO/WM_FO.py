@@ -69,9 +69,9 @@ def kafka_producer(producer):
         if item is None:
             break
 
-        topic, message = item
+        message = item
         try:
-            producer.produce(topic, value= message)
+            producer.produce(topic = 'Start_wat', value= message)
         except Exception as error:
             print(f"Error al enviar mensaje: {error}")
 
@@ -88,15 +88,14 @@ def main(*args):
 
     producer = Producer({'Puerto Kafka': kafka})
 
-    lock=threading.Lock()
 
     threading.Thread(
         target=kafka_producer,
         name='ws-watering',
-        args=(producer, producer_queue, lock),
+        args=(producer,),
         daemon=True
     ).start()
 
-
+    
 if __name__ == "__main__":
     main(sys.argv[1:])
