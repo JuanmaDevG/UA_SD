@@ -45,14 +45,21 @@ CREATE TABLE IF NOT EXISTS operators (
 FIELD_OPERATORS = ["Jeffrey", "Donald", "Charlie", "Kanye"]
 
 
-def stamp() -> str:
-    return time.strftime("%H:%M:%S")
-
-
 # System message coloring
 OK = "\033[1;32m"
 WARNING = "\033[1;33m"
 ERROR = "\033[1;31m"
+
+
+# Water station states
+DISCONNECTED = 0
+AVAILABLE = 1
+WATERING = 2
+LEAK = 3
+OUT_OF_SERVICE = 4
+
+# State names
+WS_STATE_NAMES = ["DISCONNECTED", "AVAILABLE", "WATERING", "LEAK", "OUT_OF_SERVICE"]
 
 
 # General instructions
@@ -70,7 +77,10 @@ ST_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
 
 
 # Kafka instructions
-# ...
+
+
+def stamp() -> str:
+    return time.strftime("%H:%M:%S")
 
 
 def tell(mtype: str, msg: str):
@@ -113,7 +123,7 @@ def getdb() -> sqlite3.Connection:
     elif "LOG_DIR" in os.environ:
         db_loc = Path(os.environ["LOG_DIR"])
     else:
-        db_loc = Path(__file__).parent
+        db_loc = Path(__file__).parent.parent / ".log"
 
     db_loc.mkdir(0o700, parents=True, exist_ok=True)
     db_loc /= "ws.db"
@@ -121,13 +131,14 @@ def getdb() -> sqlite3.Connection:
     db.executescript(
         DB_SCHEMA
         + "INSERT OR IGNORE INTO operators (id, x, y, name) VALUES "
-            + ",".join([str(
-                (i, round(uniform(0,1), 2),round(uniform(0,1), 2), name))
+        + ",".join(
+            [
+                str((i, round(uniform(0, 1), 2), round(uniform(0, 1), 2), name))
                 for i, name in enumerate(FIELD_OPERATORS, start=1)
-            ])
+            ]
+        )
         + ";"
-    );
-
+    )
     return db
 
 
