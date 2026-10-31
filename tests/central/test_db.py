@@ -19,7 +19,7 @@ def check_data(tc: unittest.TestCase, db: sqlite3.Connection):
     for i, fo in enumerate(FIELD_OPERATORS):
         tc.assertEqual(rows[i]["id"], i + 1)
         tc.assertEqual(rows[i]["name"], fo)
-    tc.assertEqual(db.execute("SELECT 1 FROM stations").arraysize, 0)
+    tc.assertEqual(db.execute("SELECT id FROM stations").arraysize, 0)
 
 
 class TestDBIntegrity(unittest.TestCase):
@@ -31,7 +31,7 @@ class TestDBIntegrity(unittest.TestCase):
     def test_env_vars(self):
         os.environ["DOCKER_VOLUME"] = str(DOCKER_VOLUME)
         db = getdb()
-        self.assertTrue(LOG_DIR.exists())
+        self.assertTrue(DOCKER_VOLUME.exists())
         del os.environ["DOCKER_VOLUME"]
         check_data(self, db)
 
@@ -43,9 +43,9 @@ class TestDBIntegrity(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        shutil.rmtree(LOG_DIR)
-        shutil.rmtree(DOCKER_VOLUME)
-        shutil.rmtree(ENV_LOG_DIR)
+        shutil.rmtree(LOG_DIR, ignore_errors=True)
+        shutil.rmtree(DOCKER_VOLUME, ignore_errors=True)
+        shutil.rmtree(ENV_LOG_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":
