@@ -1,0 +1,17 @@
+#!/bin/env python3
+
+from pathlib import Path
+import sys
+import unittest
+
+from tests import central
+
+
+if __name__ == "__main__":
+    pycdir = Path(__file__).parent / ".log/pycache"
+    pycdir.mkdir(0o700, parents=True, exist_ok=True)
+    sys.pycache_prefix = str(pycdir)
+    suite = unittest.TestSuite()
+    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(central.TestParams))
+    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(central.TestDBIntegrity))
+    unittest.TextTestRunner(verbosity=2, buffer=True).run(suite)

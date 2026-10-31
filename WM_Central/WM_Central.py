@@ -126,7 +126,7 @@ def getdb() -> sqlite3.Connection:
         db_loc = Path(__file__).parent.parent / ".log"
 
     db_loc.mkdir(0o700, parents=True, exist_ok=True)
-    db_loc /= "ws.db"
+    db_loc /= "wm.db"
     db = sqlite3.Connection(db_loc)
     db.executescript(
         DB_SCHEMA
