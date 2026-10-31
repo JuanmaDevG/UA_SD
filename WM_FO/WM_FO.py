@@ -13,8 +13,6 @@ import threading
 import time
 from types import SimpleNamespace
 
-from math import integer
-
 EXIT = 0x00
 STX = 0x01
 ETX = 0x02
@@ -57,9 +55,6 @@ def get_netparams(args: tuple[str, ...]) -> str:
 
     return kafka
 
-def delivery_report(err, msg):
-    if err is not None:
-        print(f"Message delivery failed: {err}")
 
 def kafka_producer(producer):
 
