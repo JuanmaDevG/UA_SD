@@ -20,7 +20,6 @@ USAGE_MSG = """
 Usage:
     WM_Central <login_port> <kafka_host>:<kafka_port>
     WM_central here
-
 Arguments:
     <login_port>    - Port in where to put login
     <kafka_host>    - Kafka server host name
@@ -33,7 +32,7 @@ CREATE TABLE IF NOT EXISTS stations (
     id INTEGER PRIMARY KEY,
     x REAL, y REAL,
     name TEXT,
-    blocked INTEGER NOT NULL DEFAULT 0
+    state INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS operators (
     id INTEGER PRIMARY KEY,
@@ -71,9 +70,9 @@ ACK = 0x04
 
 
 # Login server instructions
-ST_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
-ST_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
-ST_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
+ws_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
+ws_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
+ws_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
 
 
 # Kafka instructions
@@ -162,18 +161,18 @@ def load_entities(
     return extract("stations"), extract("operators")
 
 
-def st_login(
-    data: bytes, stations: dict[int, SimpleNamespace], st_lock: threading.Lock
+def ws_login(
+    data: bytes, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
 ) -> int:
     res = ACK
     tell(
         OK,
         f"(login server) peticion de LOGIN con id={data[1]}",
     )
-    st_lock.acquire()
+    ws_lock.acquire()
     if int(data[1]) not in stations:
         res = NACK
-    st_lock.release()
+    ws_lock.release()
     if res == NACK:
         tell(
             ERROR,
@@ -182,15 +181,15 @@ def st_login(
     return res
 
 
-def st_register(
-    data: bytes, stations: dict[int, SimpleNamespace], st_lock: threading.Lock
+def ws_register(
+    data: bytes, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
 ) -> int:
     res = ACK
     exists = False
-    st_lock.acquire()
+    ws_lock.acquire()
     if (id := data[1]) in stations:
         exists = True
-    st_lock.release()
+    ws_lock.release()
 
     tell(OK, f"(login server) comando REGISTER con id={id}")
     if exists:
@@ -202,7 +201,7 @@ def st_register(
     if data[4] == STX and (name_end := data.find(ETX, 5)) != -1:
         name: str = data[3 : name_end + 1].decode("utf-8")
         state = int(data[name_end + 2])
-        st_lock.acquire()
+        ws_lock.acquire()
         stations[id] = SimpleNamespace(
             id=id,
             name=name,
@@ -210,7 +209,7 @@ def st_register(
             x=data[2] / 255,
             y=data[3] / 255,
         )
-        st_lock.release()
+        ws_lock.release()
     else:
         res = NACK
         tell(
@@ -225,14 +224,14 @@ def st_register(
 def login_server(
     login_port: int,
     stations: dict[int, SimpleNamespace],
-    st_lock: threading.Lock,
+    ws_lock: threading.Lock,
     watchdog_queue: Queue[bytes],
 ) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", login_port))
     srv.listen(10)
-    instructions = {ST_LOGIN: st_login, ST_REGISTER: st_register}
+    instructions = {ws_LOGIN: ws_login, ws_REGISTER: ws_register}
     response = bytearray([ACK])
     try:
         while True:
@@ -247,7 +246,7 @@ def login_server(
                     )
                     srv.sendall(bytes([NACK]))
                     continue
-                response[0] = instructions[data[0]](data, stations, st_lock)
+                response[0] = instructions[data[0]](data, stations, ws_lock)
                 conn.sendall(response)
                 if response[0] == ACK:
                     watchdog_queue.put(data)
@@ -319,13 +318,12 @@ def main(*args):
         f"Se han precargado {len(stations)} estaciones y {len(operators)} operadores",
     )
 
-    # TODO: change the st_lock with a threading.Lock
-    st_lock = threading.Lock()
+    ws_lock = threading.Lock()
     watchdog_queue = Queue()
     threading.Thread(
         target=login_server,
         name="wm-login",
-        args=(login_port, stations, st_lock, watchdog_queue),
+        args=(login_port, stations, ws_lock, watchdog_queue),
         daemon=True,
     ).start()
 

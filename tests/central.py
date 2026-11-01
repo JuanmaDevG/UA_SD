@@ -1,11 +1,13 @@
 import os
 import shutil
 import sqlite3
+from types import SimpleNamespace
 import unittest
 
+from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
 from WM_Central import get_netparams
 from WM_Central import FIELD_OPERATORS, getdb
-from tests import *
+from WM_Central import load_entities
 
 
 class TestParams(unittest.TestCase):
@@ -41,22 +43,28 @@ class TestParams(unittest.TestCase):
 
 class TestDBIntegrity(unittest.TestCase):
     def test_no_env(self):
-        db = getdb()
+        self.db = getdb()
         self.assertTrue(LOG_DIR.exists())
-        self.check_data(db)
+        self.check_data(self.db)
+        self.db.close()
 
     def test_env_vars(self):
         os.environ["DOCKER_VOLUME"] = str(DOCKER_VOLUME)
-        db = getdb()
+        self.db = getdb()
         self.assertTrue(DOCKER_VOLUME.exists())
         del os.environ["DOCKER_VOLUME"]
-        self.check_data(db)
+        self.check_data(self.db)
+        self.db.close()
 
         os.environ["LOG_DIR"] = str(ENV_LOG_DIR)
-        db = getdb()
+        self.db = getdb()
         self.assertTrue(ENV_LOG_DIR.exists())
         del os.environ["LOG_DIR"]
-        self.check_data(db)
+        self.check_data(self.db)
+        self.db.close()
+
+    def tearDown(self):
+        self.db.close()
 
     def check_data(self, db: sqlite3.Connection):
         db.row_factory = sqlite3.Row
@@ -71,6 +79,64 @@ class TestDBIntegrity(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        os.remove(LOG_DIR / "wm.db")
+        os.remove(str(LOG_DIR / "wm.db"))
         shutil.rmtree(DOCKER_VOLUME)
         shutil.rmtree(ENV_LOG_DIR)
+
+
+class TestEntities(unittest.TestCase):
+    def test_load_entities(self):
+        stations, operators = load_entities(self.db)
+        self.assertEqual(len(stations), 0)
+        sample_op: SimpleNamespace = next(iter(operators.values()))
+        self.assertTrue(hasattr(sample_op, "id"))
+        self.assertTrue(hasattr(sample_op, "x"))
+        self.assertTrue(hasattr(sample_op, "y"))
+        self.assertTrue(hasattr(sample_op, "name"))
+        for i, fo in enumerate(operators.values()):
+            self.assertEqual(fo.id, i + 1)
+            self.assertEqual(fo.name, FIELD_OPERATORS[i])
+
+    def test_load_with_station(self):
+        self.db.executescript(
+            "INSERT INTO stations (id, x, y, name) VALUES (1, 2, 3, 'shawty')"
+        )
+        stations, _ = load_entities(self.db)
+        sample_ws: SimpleNamespace = next(iter(stations.values()))
+        self.assertTrue(hasattr(sample_ws, "id"))
+        self.assertTrue(hasattr(sample_ws, "x"))
+        self.assertTrue(hasattr(sample_ws, "y"))
+        self.assertTrue(hasattr(sample_ws, "name"))
+        self.assertTrue(hasattr(sample_ws, "state"))
+        self.assertEqual(sample_ws.id, 1)
+        self.assertEqual(sample_ws.x, 2)
+        self.assertEqual(sample_ws.y, 3)
+        self.assertEqual(sample_ws.name, "shawty")
+        self.assertEqual(sample_ws.state, 0)
+
+    def setUp(self) -> None:
+        self.db = getdb()
+
+    def tearDown(self) -> None:
+        self.db.close()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        os.remove(str(LOG_DIR / "wm.db"))
+
+
+class TestRegisterWaterStation(unittest.TestCase):
+    def test_register(self):
+        pass
+
+    def test_register_noexist(self):
+        pass
+
+    def test_register_updates(self):
+        pass
+
+    def setUp(self):
+        pass  # dict and stuff
+
+    def tearDown(self):
+        pass  # cleanup if necessary

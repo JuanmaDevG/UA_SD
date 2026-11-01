@@ -1,17 +1,90 @@
 #!/bin/env python3
 
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
+import ast
+from difflib import get_close_matches
+from importlib import import_module
 
 from tests import central
 
+TEST_DIR = Path(__file__).parent / "tests"
+
+USAGE_MSG = """
+Usage:
+    run_tests [-h | --help | -l , TestClassName]
+Arguments:
+    -h | --help     - Show this message
+    -l              - List available test cases
+    TestCaseName    - The name of a test case to be executed
+"""
+
+
+def class_names(directory):
+    return [
+        node.name
+        for py in Path(directory).rglob("*.py")
+        if py.name != "__init__.py"
+        for node in ast.parse(py.read_text()).body
+        if isinstance(node, ast.ClassDef)
+    ]
+
+
+def run_similar_tests(directory, query):
+    names = class_names(directory)
+
+    matches = get_close_matches(query, names, n=len(names), cutoff=0.4)
+    if not matches:
+        print(f"No classes similar to {query!r}. <run_tests -h> for help")
+        return
+
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for name in matches:
+        cls = getattr(central, name, None)
+        if cls is None or not issubclass(cls, unittest.TestCase):
+            continue
+        suite.addTests(loader.loadTestsFromTestCase(cls))
+
+    unittest.TextTestRunner(verbosity=2, buffer=True, failfast=True).run(suite)
+
+
+def add_all_test_cases(
+    directory: Path | str, suite: unittest.TestSuite, *, package_root=None
+):
+    root = Path(directory).resolve()
+    base = Path(package_root).resolve() if package_root else root
+
+    for py in root.rglob("*.py"):
+        if py.name == "__init__.py":
+            continue
+
+        tree = ast.parse(py.read_text())
+        classes = [n.name for n in tree.body if isinstance(n, ast.ClassDef)]
+        if not classes:
+            continue
+
+        rel = py.with_suffix("").relative_to(base)
+        module = import_module(".".join(rel.parts))
+
+        for name in classes:
+            cls = getattr(module, name)
+            if isinstance(cls, type) and issubclass(cls, unittest.TestCase):
+                suite.addTests(unittest.TestLoader().loadTestsFromTestCase(cls))
+
 
 if __name__ == "__main__":
-    pycdir = Path(__file__).parent / ".log/pycache"
-    pycdir.mkdir(0o700, parents=True, exist_ok=True)
-    sys.pycache_prefix = str(pycdir)
+    if len(sys.argv) == 2:
+        op = sys.argv[1]
+        if op in ("-h", "--help"):
+            print(USAGE_MSG)
+        elif op == "-l":
+            print(*class_names(str(Path(__file__).parent / "tests")))
+        else:
+            run_similar_tests("tests", op)
+        sys.exit()
+
     suite = unittest.TestSuite()
-    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(central.TestParams))
-    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(central.TestDBIntegrity))
-    unittest.TextTestRunner(verbosity=2, buffer=True).run(suite)
+    add_all_test_cases(TEST_DIR, suite, package_root=TEST_DIR.parent)
+    unittest.TextTestRunner(verbosity=2, buffer=True, failfast=True).run(suite)
