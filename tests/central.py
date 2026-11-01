@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import unittest
 
 from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
-from WM_Central import get_netparams
+from WM_Central import STX, ETX
+
+from WM_Central import WS_REGISTER, get_netparams
 from WM_Central import FIELD_OPERATORS, getdb
 from WM_Central import load_entities
 
@@ -127,7 +129,8 @@ class TestEntities(unittest.TestCase):
 
 class TestRegisterWaterStation(unittest.TestCase):
     def test_register(self):
-        pass
+        data = bytes([WS_REGISTER, 1, 1, 1, STX, *b"Saint Jones", ETX, 0])
+        # TODO: make dictionary
 
     def test_register_noexist(self):
         pass

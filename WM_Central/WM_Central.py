@@ -70,9 +70,9 @@ ACK = 0x04
 
 
 # Login server instructions
-ws_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
-ws_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
-ws_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
+WS_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
+WS_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
+WS_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
 
 
 # Kafka instructions
