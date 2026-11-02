@@ -71,11 +71,19 @@ ACK = 0x04
 
 # Login server instructions
 WS_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
-WS_LOGIN = 0x06  # bytes[0x06, id (1 byte)]
-WS_ACK_LOGGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
+WS_LOGIN = 0x06  # bytes[0x06, id]
+SERVER_ACK_WS_LOGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
+SERVER_ACK_WS_REGISTER = 0x08  # bytes[0x08, id]
 
 
 # Kafka instructions
+# ...
+
+
+INSTRUCTION_NAMES = {
+    WS_REGISTER: "REGISTER_WATERING_STATION",
+    WS_LOGIN: "LOGIN_WATERING_STATION",
+}
 
 
 def stamp() -> str:
@@ -163,62 +171,81 @@ def load_entities(
 
 def ws_login(
     data: bytes, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
-) -> int:
-    res = ACK
-    tell(
-        OK,
-        f"(login server) peticion de LOGIN con id={data[1]}",
-    )
-    ws_lock.acquire()
-    if int(data[1]) not in stations:
-        res = NACK
-    ws_lock.release()
-    if res == NACK:
+) -> bytes:
+    if len(data) != 2:
+        return bytes([NACK])
+
+    station_id = data[1]
+    tell(OK, f"(login server) peticion de LOGIN con id={station_id}")
+
+    with ws_lock:
+        station = stations.get(station_id)
+
+    if station is None:
         tell(
             ERROR,
-            f"(login server) el id={data[1]} no existe, debe registrarse...",
+            f"(login server) el id={station_id} no existe, debe registrarse...",
         )
-    return res
+        return bytes([NACK])
+
+    return (
+        bytes(
+            [
+                SERVER_ACK_WS_LOGIN,
+                station.id,
+                round(station.x * 255),
+                round(station.y * 255),
+                STX,
+            ]
+        )
+        + station.name.encode("utf-8")
+        + bytes([ETX, station.state])
+    )
 
 
 def ws_register(
     data: bytes, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
-) -> int:
-    res = ACK
-    exists = False
-    ws_lock.acquire()
-    if (id := data[1]) in stations:
-        exists = True
-    ws_lock.release()
+) -> bytes:
+    if len(data) < 7:
+        return bytes([NACK])
 
-    tell(OK, f"(login server) comando REGISTER con id={id}")
-    if exists:
+    station_id = data[1]
+    tell(OK, f"(login server) comando REGISTER con id={station_id}")
+
+    name_end = data.find(ETX, 5)
+    if data[4] != STX or name_end == -1 or name_end + 1 >= len(data):
         tell(
-            WARNING,
-            f"(login server) el id={id} ya estaba registrado, actualizando datos...",
+            ERROR,
+            f"(login server) registro para id={station_id} formato incorrecto de "
+            "argumentos, falta STX y/o ETX en el campo <name>",
         )
+        return bytes([NACK])
 
-    if data[4] == STX and (name_end := data.find(ETX, 5)) != -1:
-        name: str = data[3 : name_end + 1].decode("utf-8")
-        state = int(data[name_end + 2])
-        ws_lock.acquire()
-        stations[id] = SimpleNamespace(
-            id=id,
+    try:
+        name = data[5:name_end].decode("utf-8")
+    except UnicodeDecodeError:
+        tell(
+            ERROR,
+            f"(login server) registro para id={station_id}: <name> no es UTF-8 valido",
+        )
+        return bytes([NACK])
+
+    with ws_lock:
+        if station_id in stations:
+            tell(
+                WARNING,
+                f"(login server) el id={station_id} ya estaba registrado, "
+                "actualizando datos...",
+            )
+        stations[station_id] = SimpleNamespace(
+            id=station_id,
             name=name,
-            state=state,
+            state=data[name_end + 1],
             x=data[2] / 255,
             y=data[3] / 255,
         )
-        ws_lock.release()
-    else:
-        res = NACK
-        tell(
-            ERROR,
-            f"(login server) registro para id={id} formato incorrecto de argumentos"
-            ", falta STX y/o ETX en el campo <name>",
-        )
 
-    return res
+    return bytes([SERVER_ACK_WS_REGISTER, station_id])
 
 
 def login_server(
@@ -226,37 +253,58 @@ def login_server(
     stations: dict[int, SimpleNamespace],
     ws_lock: threading.Lock,
     watchdog_queue: Queue[bytes],
+    shutdown_event: threading.Event,
 ) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", login_port))
     srv.listen(10)
-    instructions = {ws_LOGIN: ws_login, ws_REGISTER: ws_register}
-    response = bytearray([ACK])
+    srv.settimeout(0.3)
+    instructions = {WS_LOGIN: ws_login, WS_REGISTER: ws_register}
+    response = bytes([NACK])
     try:
-        while True:
-            conn, addr = srv.accept()
+        while not shutdown_event.is_set():
+            try:
+                conn, addr = srv.accept()
+            except TimeoutError:
+                continue
             tell(OK, f"(login server) {addr} se ha conectado")
             with conn:
+                conn.settimeout(3)
                 data = conn.recv(512)
-                if int(data[0]) not in instructions:
+                if not data:
+                    tell(WARNING, f"(login server) client {addr} disconnected")
+                    continue
+                if data[0] not in instructions:
                     tell(
                         ERROR,
                         f"(login server) {addr} ha enviado una instruccion desconocida",
                     )
-                    srv.sendall(bytes([NACK]))
+                    conn.sendall(bytes([NACK]))
                     continue
-                response[0] = instructions[data[0]](data, stations, ws_lock)
+                try:
+                    response = instructions[data[0]](data, stations, ws_lock)
+                except IndexError as ierr:
+                    tell(
+                        ERROR,
+                        f"(login server) instruccion malformada "
+                        f"{INSTRUCTION_NAMES[data[0]]} de {addr} "
+                        f"{ierr}",
+                    )
+                    response = bytes([NACK])
                 conn.sendall(response)
-                if response[0] == ACK:
+                if response[0] != NACK:
                     watchdog_queue.put(data)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        tell(OK, "(login server) Saliendo...")
         srv.close()
 
 
-def watchdog(db: sqlite3.Connection, q: Queue[bytes]) -> None:
+def watchdog(
+    db: sqlite3.Connection, q: Queue[bytes], shutdown_event: threading.Event
+) -> None:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute("PRAGMA busy_timeout=5000")
@@ -264,7 +312,7 @@ def watchdog(db: sqlite3.Connection, q: Queue[bytes]) -> None:
     changes.execute("BEGIN")
     try:
         start = time.monotonic()
-        while True:
+        while not shutdown_event.is_set():
             v = q.get()
             if v[0] == EXIT:
                 break

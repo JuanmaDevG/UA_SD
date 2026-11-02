@@ -3,13 +3,29 @@ import shutil
 import sqlite3
 from types import SimpleNamespace
 import unittest
+import threading
+from queue import Queue
+import socket
+import psutil
 
 from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
 from WM_Central import STX, ETX
 
-from WM_Central import WS_REGISTER, get_netparams
+# Import functions to test
+from WM_Central import get_netparams
 from WM_Central import FIELD_OPERATORS, getdb
 from WM_Central import load_entities
+from WM_Central import (
+    DISCONNECTED,
+    AVAILABLE,
+    LEAK,
+    OUT_OF_SERVICE,
+    WS_REGISTER,
+    WS_LOGIN,
+    SERVER_ACK_WS_LOGIN,
+    SERVER_ACK_WS_REGISTER,
+    login_server,
+)
 
 
 class TestParams(unittest.TestCase):
@@ -127,19 +143,114 @@ class TestEntities(unittest.TestCase):
         os.remove(str(LOG_DIR / "wm.db"))
 
 
-class TestRegisterWaterStation(unittest.TestCase):
-    def test_register(self):
-        data = bytes([WS_REGISTER, 1, 1, 1, STX, *b"Saint Jones", ETX, 0])
-        # TODO: make dictionary
-
-    def test_register_noexist(self):
-        pass
-
-    def test_register_updates(self):
-        pass
+class TestLoginServer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.login_port = 5000
+        cls.lock = threading.Lock()
 
     def setUp(self):
-        pass  # dict and stuff
+        self.shutdown = threading.Event()
+        self.stations = {
+            1: SimpleNamespace(id=1, x=0.5, y=0.5, name="City Center", state=0),
+            2: SimpleNamespace(id=1, x=0.3, y=0.1, name="Sample Park"),
+        }
+        self.q = Queue()
+        self.server = threading.Thread(
+            target=login_server,
+            name="login-server",
+            args=(self.login_port, self.stations, self.lock, self.q, self.shutdown),
+        )
+        self.client: socket.socket
+
+    def wait_for_server(self):
+        available = False
+        while not available:
+            for conn in psutil.net_connections(kind="inet"):
+                if (
+                    conn.laddr
+                    and conn.laddr.port == self.login_port
+                    and conn.status == psutil.CONN_LISTEN
+                ):
+                    available = True
+
+    def client_interaction(self, msg: bytes) -> bytes:
+        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.client.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.wait_for_server()
+        self.client.connect(("0.0.0.0", self.login_port))
+        self.client.settimeout(2)
+        self.client.sendall(msg)
+        response = self.client.recv(512)
+        if self.client.recv(512):  # Conn not closed
+            self.fail()
+        self.client.close()
+        return response
+
+    def server_is_alive(self) -> bool:
+        for conn in psutil.net_connections(kind="inet"):
+            if (
+                conn.laddr
+                and conn.laddr.port == self.login_port
+                and conn.status == psutil.CONN_LISTEN
+            ):
+                return True
+        return False
 
     def tearDown(self):
-        pass  # cleanup if necessary
+        self.shutdown.set()
+        if hasattr(self, "client") and self.client and self.client.fileno() != -1:
+            self.client.close()
+
+    def test_01_obey_shutdown_onwait(self):
+        self.server.start()
+        self.shutdown.set()
+        try:
+            self.server.join(timeout=3)
+            self.assertFalse(self.server.is_alive())
+        except TimeoutError:
+            self.fail()
+
+    def test_02_register(self):
+        self.server.start()
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 3, 50, 50, STX, *list(b"Six Seven"), ETX, AVAILABLE])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 3]))
+        # TODO: check self.stations
+        with self.lock:
+            pass
+
+    def test_03_register_duplicated(self):
+        self.server.start()
+        # TODO: maybe is better to receive a NACK
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 2, 100, 100, STX, *b"New name"])
+        )
+
+    def test_04_login(self):
+        pass
+
+    def test_05_login_failed(self):
+        pass
+
+    def test_06_nonexistent_instruction(self):
+        pass
+
+    def test_07_malformed_instruction(self):
+        pass
+
+    def test_08_register_wsnoexist(self):
+        pass
+
+
+class TestWatchdog(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        pass
+
+    def setUp(self) -> None:
+        pass
+
+    def tearDown(self) -> None:
+        pass
