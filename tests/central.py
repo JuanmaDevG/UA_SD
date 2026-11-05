@@ -9,7 +9,7 @@ import socket
 import psutil
 
 from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
-from WM_Central import STX, ETX
+from WM_Central import STX, ETX, NACK
 
 # Import functions to test
 from WM_Central import get_netparams
@@ -29,10 +29,10 @@ from WM_Central import (
 
 
 class TestParams(unittest.TestCase):
-    def test_noparams(self):
+    def test_01_noparams(self):
         self.assertRaises(SystemExit, get_netparams, ())
 
-    def test_wrongparams(self):
+    def test_02_wrongparams(self):
         self.assertRaises(SystemExit, get_netparams, ("not_here",))
         self.assertRaises(SystemExit, get_netparams, ("not_a_port", "localhost:8000"))
         self.assertRaises(SystemExit, get_netparams, ("5000", "not_a_broker"))
@@ -43,16 +43,16 @@ class TestParams(unittest.TestCase):
             SystemExit, get_netparams, ("5000", "broker.domain:not_a_port")
         )
 
-    def test_lessparams(self):
+    def test_03_lessparams(self):
         self.assertRaises(SystemExit, get_netparams, ("5000"))
         self.assertRaises(SystemExit, get_netparams, ("localhost:8000"))
 
-    def test_toomanyparams(self):
+    def test_04_toomanyparams(self):
         self.assertRaises(
             SystemExit, get_netparams, ("5000", "localhost:8000", "unrelated")
         )
 
-    def test_correctparams(self):
+    def test_05_correctparams(self):
         self.assertEqual(
             get_netparams(("2000", "localhost:3000")), (2000, "localhost:3000")
         )
@@ -60,13 +60,13 @@ class TestParams(unittest.TestCase):
 
 
 class TestDBIntegrity(unittest.TestCase):
-    def test_no_env(self):
+    def test_01_no_env(self):
         self.db = getdb()
         self.assertTrue(LOG_DIR.exists())
         self.check_data(self.db)
         self.db.close()
 
-    def test_env_vars(self):
+    def test_02_env_vars(self):
         os.environ["DOCKER_VOLUME"] = str(DOCKER_VOLUME)
         self.db = getdb()
         self.assertTrue(DOCKER_VOLUME.exists())
@@ -103,7 +103,7 @@ class TestDBIntegrity(unittest.TestCase):
 
 
 class TestEntities(unittest.TestCase):
-    def test_load_entities(self):
+    def test_01_load_entities(self):
         stations, operators = load_entities(self.db)
         self.assertEqual(len(stations), 0)
         sample_op: SimpleNamespace = next(iter(operators.values()))
@@ -115,7 +115,7 @@ class TestEntities(unittest.TestCase):
             self.assertEqual(fo.id, i + 1)
             self.assertEqual(fo.name, FIELD_OPERATORS[i])
 
-    def test_load_with_station(self):
+    def test_02_load_with_station(self):
         self.db.executescript(
             "INSERT INTO stations (id, x, y, name) VALUES (1, 2, 3, 'shawty')"
         )
@@ -152,8 +152,10 @@ class TestLoginServer(unittest.TestCase):
     def setUp(self):
         self.shutdown = threading.Event()
         self.stations = {
-            1: SimpleNamespace(id=1, x=0.5, y=0.5, name="City Center", state=0),
-            2: SimpleNamespace(id=1, x=0.3, y=0.1, name="Sample Park"),
+            1: SimpleNamespace(
+                id=1, x=127, y=127, name="City Center", state=DISCONNECTED
+            ),
+            2: SimpleNamespace(id=2, x=76, y=25, name="Sample Park", state=AVAILABLE),
         }
         self.q = Queue()
         self.server = threading.Thread(
@@ -162,6 +164,7 @@ class TestLoginServer(unittest.TestCase):
             args=(self.login_port, self.stations, self.lock, self.q, self.shutdown),
         )
         self.client: socket.socket
+        self.server.start()
 
     def wait_for_server(self):
         available = False
@@ -201,47 +204,110 @@ class TestLoginServer(unittest.TestCase):
         self.shutdown.set()
         if hasattr(self, "client") and self.client and self.client.fileno() != -1:
             self.client.close()
-
-    def test_01_obey_shutdown_onwait(self):
-        self.server.start()
-        self.shutdown.set()
         try:
             self.server.join(timeout=3)
             self.assertFalse(self.server.is_alive())
         except TimeoutError:
             self.fail()
 
+    def test_01_start_and_shutdown(self):
+        pass
+
     def test_02_register(self):
-        self.server.start()
         response = self.client_interaction(
             bytes([WS_REGISTER, 3, 50, 50, STX, *list(b"Six Seven"), ETX, AVAILABLE])
         )
         self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 3]))
-        # TODO: check self.stations
         with self.lock:
-            pass
+            self.assertTrue(3 in self.stations)
 
-    def test_03_register_duplicated(self):
-        self.server.start()
-        # TODO: maybe is better to receive a NACK
+    def test_03_register_wsexist_update(self):
         response = self.client_interaction(
-            bytes([WS_REGISTER, 2, 100, 100, STX, *b"New name"])
+            bytes([WS_REGISTER, 2, 100, 100, STX, *b"New name", ETX, LEAK])
         )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 2]))
+        with self.lock:
+            self.assertTrue(2 in self.stations)
+            self.assertEqual(
+                self.stations[2],
+                SimpleNamespace(
+                    id=2,
+                    x=100,
+                    y=100,
+                    name="New name",
+                    state=LEAK,
+                ),
+            )
 
     def test_04_login(self):
-        pass
+        response = self.client_interaction(bytes([WS_LOGIN, 2]))
+        self.assertEqual(
+            response,
+            bytes(
+                [SERVER_ACK_WS_LOGIN, 2, 76, 25, STX, *b"Sample Park", ETX, AVAILABLE]
+            ),
+        )
 
-    def test_05_login_failed(self):
-        pass
+    def test_05_login_wsnoexist(self):
+        response = self.client_interaction(bytes([WS_LOGIN, 3]))
+        self.assertEqual(response, bytes([NACK]))
 
     def test_06_nonexistent_instruction(self):
-        pass
+        response = self.client_interaction(bytes([NACK, 0x01, 0x02]))
+        self.assertEqual(response, bytes([NACK]))
 
     def test_07_malformed_instruction(self):
-        pass
+        response = self.client_interaction(bytes([WS_LOGIN, 1, *b"bad"]))
+        self.assertEqual(response, bytes([NACK]))
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 1, *b"longer string is worse"])
+        )
+        self.assertEqual(response, bytes([NACK]))
 
-    def test_08_register_wsnoexist(self):
-        pass
+    def test_08_no_instruction(self):
+        response = self.client_interaction(b"")
+        self.assertEqual(response, bytes([NACK]))
+
+    def test_09_multiple_ops(self):
+        response = self.client_interaction(bytes([WS_LOGIN, 1]))
+        self.assertEqual(
+            response,
+            bytes(
+                [
+                    SERVER_ACK_WS_LOGIN,
+                    1,
+                    127,
+                    127,
+                    STX,
+                    *b"City Center",
+                    ETX,
+                    DISCONNECTED,
+                ]
+            ),
+        )
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 2, 76, 25, STX, *b"Sample Park", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 2]))
+        with self.lock:
+            self.assertEqual(
+                self.stations,
+                SimpleNamespace(id=2, x=76, y=25, name="Sample Park", state=LEAK),
+            )
+        response = self.client_interaction(b"")
+        self.assertEqual(response, bytes([NACK]))
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 3, 123, 40, STX, *b"Las mil viviendas", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 3]))
+        with self.lock:
+            self.assertEqual(
+                response,
+                SimpleNamespace(
+                    id=3, x=127, y=40, name="Las mil viviendas", state=LEAK
+                ),
+            )
+        # TODO: make more insertions later and login some of those
 
 
 class TestWatchdog(unittest.TestCase):

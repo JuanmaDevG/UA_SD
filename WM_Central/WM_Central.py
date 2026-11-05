@@ -12,7 +12,7 @@ import sqlite3
 import sys
 import threading
 import time
-from random import uniform
+from random import randint
 from types import SimpleNamespace
 
 
@@ -30,13 +30,13 @@ Arguments:
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS stations (
     id INTEGER PRIMARY KEY,
-    x REAL, y REAL,
+    x INTEGER, y INTEGER,
     name TEXT,
     state INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS operators (
     id INTEGER PRIMARY KEY,
-    x REAL, y REAL,
+    x INTEGER, y INTEGER,
     name TEXT
 );
 """
@@ -140,7 +140,7 @@ def getdb() -> sqlite3.Connection:
         + "INSERT OR IGNORE INTO operators (id, x, y, name) VALUES "
         + ",".join(
             [
-                str((i, round(uniform(0, 1), 2), round(uniform(0, 1), 2), name))
+                str((i, randint(0, 255), randint(0, 255), name))
                 for i, name in enumerate(FIELD_OPERATORS, start=1)
             ]
         )
@@ -193,8 +193,8 @@ def ws_login(
             [
                 SERVER_ACK_WS_LOGIN,
                 station.id,
-                round(station.x * 255),
-                round(station.y * 255),
+                station.x,
+                station.y,
                 STX,
             ]
         )
@@ -241,8 +241,8 @@ def ws_register(
             id=station_id,
             name=name,
             state=data[name_end + 1],
-            x=data[2] / 255,
-            y=data[3] / 255,
+            x=data[2],
+            y=data[3],
         )
 
     return bytes([SERVER_ACK_WS_REGISTER, station_id])
@@ -273,7 +273,11 @@ def login_server(
                 conn.settimeout(3)
                 data = conn.recv(512)
                 if not data:
-                    tell(WARNING, f"(login server) client {addr} disconnected")
+                    tell(
+                        WARNING,
+                        f"(login server) el client {addr} no ha enviado contenido",
+                    )
+                    conn.sendall(bytes([NACK]))
                     continue
                 if data[0] not in instructions:
                     tell(
