@@ -264,11 +264,7 @@ class TestLoginServer(unittest.TestCase):
         )
         self.assertEqual(response, bytes([NACK]))
 
-    def test_08_no_instruction(self):
-        response = self.client_interaction(b"")
-        self.assertEqual(response, bytes([NACK]))
-
-    def test_09_multiple_ops(self):
+    def test_08_multiple_ops(self):
         response = self.client_interaction(bytes([WS_LOGIN, 1]))
         self.assertEqual(
             response,
@@ -291,20 +287,18 @@ class TestLoginServer(unittest.TestCase):
         self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 2]))
         with self.lock:
             self.assertEqual(
-                self.stations,
+                self.stations[2],
                 SimpleNamespace(id=2, x=76, y=25, name="Sample Park", state=LEAK),
             )
-        response = self.client_interaction(b"")
-        self.assertEqual(response, bytes([NACK]))
         response = self.client_interaction(
             bytes([WS_REGISTER, 3, 123, 40, STX, *b"Las mil viviendas", ETX, LEAK])
         )
         self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 3]))
         with self.lock:
             self.assertEqual(
-                response,
+                self.stations[3],
                 SimpleNamespace(
-                    id=3, x=127, y=40, name="Las mil viviendas", state=LEAK
+                    id=3, x=123, y=40, name="Las mil viviendas", state=LEAK
                 ),
             )
         # TODO: make more insertions later and login some of those

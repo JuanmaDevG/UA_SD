@@ -275,7 +275,7 @@ def login_server(
                 if not data:
                     tell(
                         WARNING,
-                        f"(login server) el client {addr} no ha enviado contenido",
+                        f"(login server) el cliente {addr} se ha desconectado",
                     )
                     conn.sendall(bytes([NACK]))
                     continue
