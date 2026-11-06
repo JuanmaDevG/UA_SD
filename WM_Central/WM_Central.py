@@ -57,7 +57,8 @@ WATERING = 2
 LEAK = 3
 OUT_OF_SERVICE = 4
 
-# State names
+# WS state metadata
+WS_STATES = (DISCONNECTED, AVAILABLE, WATERING, LEAK, OUT_OF_SERVICE)
 WS_STATE_NAMES = ["DISCONNECTED", "AVAILABLE", "WATERING", "LEAK", "OUT_OF_SERVICE"]
 
 
@@ -84,6 +85,43 @@ INSTRUCTION_NAMES = {
     WS_REGISTER: "REGISTER_WATERING_STATION",
     WS_LOGIN: "LOGIN_WATERING_STATION",
 }
+
+
+class InsFmtException(Exception):
+    def __init__(self, i: bytes, msg: str = "") -> None:
+        self.instruction = i
+        self.msg = msg
+        super().__init__(f"(opcode: {i[0]}) {msg}")
+
+
+def decompress_instruction(i: bytes) -> SimpleNamespace | None:
+    if not len(i):
+        raise InsFmtException(i, "Empty instruction")
+
+    def ws_fmt(i: bytes) -> SimpleNamespace | None:
+        name_end: int
+        state: int
+        if len(i) < 7:
+            raise InsFmtException(
+                i,
+                f"Este opcode debe tener tener 7 bytes o mas, y tiene {len(i)}",
+            )
+        if i[4] != STX:
+            raise InsFmtException(i, "Falta STX en el quinto byte")
+        if (name_end := i.find(ETX, 5)) == -1:
+            raise InsFmtException(i, "Falta ETX como delimitador del campo 'name'")
+        if (state := i[len(i) - 1]) not in WS_STATES:
+            raise InsFmtException(i, f"El estado de la WS con id={i[1]} no existe")
+        return SimpleNamespace(
+            id=i[1], x=i[2], y=i[3], name=i[5:name_end].decode(), state=state
+        )
+
+    def id_fmt(i: bytes) -> SimpleNamespace | None:
+        pass  # TODO: continue here
+
+
+def compress_namespace(opcode: int, ns: SimpleNamespace) -> bytes:
+    return b""  # TODO: from ns to instruction
 
 
 def stamp() -> str:
