@@ -306,9 +306,8 @@ def login_server(
         srv.close()
 
 
-def watchdog(
-    db: sqlite3.Connection, q: Queue[bytes], shutdown_event: threading.Event
-) -> None:
+def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
+    db = getdb()
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute("PRAGMA busy_timeout=5000")
@@ -317,11 +316,20 @@ def watchdog(
     try:
         start = time.monotonic()
         while not shutdown_event.is_set():
-            v = q.get()
-            if v[0] == EXIT:
+            ins = q.get()
+            if ins[0] == EXIT:
                 break
 
-            # TODO: apply instruction to cursor
+            if ins[0] == WS_REGISTER:
+                r = db.execute(
+                    "SELECT id FROM stations WHERE id = ?", (ins[1],)
+                ).fetchone()
+                if r is None:
+                    db.execute("INSERT INTO stations VALUES (?,?,?,?,?)")
+                db.execute("")
+            elif ins[0] == WS_LOGIN:
+                db.execute("")
+            # TODO: apply kafka instructions when available
 
             if time.monotonic() - start >= 5.0:
                 tell(OK, "(watchdog) updating database...")
@@ -365,24 +373,27 @@ def main(*args):
     tell(OK, "Conectado exitosamente con la base de datos")
 
     stations, operators = load_entities(db)
+    db.close()
+    del db
     tell(
         OK,
         f"Se han precargado {len(stations)} estaciones y {len(operators)} operadores",
     )
 
+    shutdown_event = threading.Event()
     ws_lock = threading.Lock()
     watchdog_queue = Queue()
     threading.Thread(
         target=login_server,
         name="wm-login",
-        args=(login_port, stations, ws_lock, watchdog_queue),
+        args=(login_port, stations, ws_lock, watchdog_queue, shutdown_event),
         daemon=True,
     ).start()
 
     threading.Thread(
         target=watchdog,
         name="wm-dbwatchdog",
-        args=(db, watchdog_queue),
+        args=(watchdog_queue, shutdown_event),
         daemon=True,
     ).start()
 

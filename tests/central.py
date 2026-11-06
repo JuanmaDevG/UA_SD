@@ -7,9 +7,10 @@ import threading
 from queue import Queue
 import socket
 import psutil
+import time
 
 from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
-from WM_Central import STX, ETX, NACK
+from WM_Central import STX, ETX, NACK, WATERING
 
 # Import functions to test
 from WM_Central import get_netparams
@@ -26,6 +27,7 @@ from WM_Central import (
     SERVER_ACK_WS_REGISTER,
     login_server,
 )
+from WM_Central import EXIT, watchdog
 
 
 class TestParams(unittest.TestCase):
@@ -301,16 +303,182 @@ class TestLoginServer(unittest.TestCase):
                     id=3, x=123, y=40, name="Las mil viviendas", state=LEAK
                 ),
             )
-        # TODO: make more insertions later and login some of those
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 4, 45, 12, STX, *b"Centro", ETX, OUT_OF_SERVICE])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 4]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[4],
+                SimpleNamespace(id=4, x=45, y=12, name="Centro", state=OUT_OF_SERVICE),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 5, 78, 23, STX, *b"La Estacion", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 5]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[5],
+                SimpleNamespace(id=5, x=78, y=23, name="La Estacion", state=LEAK),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 6, 200, 55, STX, *b"El Parque", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 6]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[6],
+                SimpleNamespace(id=6, x=200, y=55, name="El Parque", state=LEAK),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 7, 33, 90, STX, *b"San Jose", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 7]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[7],
+                SimpleNamespace(id=7, x=33, y=90, name="San Jose", state=LEAK),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 8, 150, 67, STX, *b"Las Flores", ETX, DISCONNECTED])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 8]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[8],
+                SimpleNamespace(
+                    id=8, x=150, y=67, name="Las Flores", state=DISCONNECTED
+                ),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 9, 89, 34, STX, *b"El Mirador", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 9]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[9],
+                SimpleNamespace(id=9, x=89, y=34, name="El Mirador", state=LEAK),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 10, 12, 78, STX, *b"La Colina", ETX, AVAILABLE])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 10]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[10],
+                SimpleNamespace(id=10, x=12, y=78, name="La Colina", state=AVAILABLE),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 11, 175, 44, STX, *b"Villa Nueva", ETX, LEAK])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 11]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[11],
+                SimpleNamespace(id=11, x=175, y=44, name="Villa Nueva", state=LEAK),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 12, 66, 111, STX, *b"Puerto Sol", ETX, AVAILABLE])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 12]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[12],
+                SimpleNamespace(id=12, x=66, y=111, name="Puerto Sol", state=AVAILABLE),
+            )
+
+        response = self.client_interaction(
+            bytes([WS_REGISTER, 13, 99, 5, STX, *b"Monte Alto", ETX, WATERING])
+        )
+        self.assertEqual(response, bytes([SERVER_ACK_WS_REGISTER, 13]))
+        with self.lock:
+            self.assertEqual(
+                self.stations[13],
+                SimpleNamespace(id=13, x=99, y=5, name="Monte Alto", state=WATERING),
+            )
 
 
 class TestWatchdog(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        pass
+        cls.db_path = LOG_DIR / "wm.db"
 
     def setUp(self) -> None:
-        pass
+        if self.db_path.exists():
+            os.remove(str(self.db_path))
+        os.environ.pop("DOCKER_VOLUME", None)
+        os.environ.pop("LOG_DIR", None)
+        self.db = getdb()
+        self.q: Queue[bytes] = Queue()
+        self.shutdown = threading.Event()
+        self.thread = threading.Thread(
+            target=watchdog,
+            name="test-watchdog",
+            args=(self.db, self.q, self.shutdown),
+            daemon=True,
+        )
+        self.thread.start()
 
     def tearDown(self) -> None:
-        pass
+        self.shutdown.set()
+        self.q.put(bytes([EXIT]))
+        try:
+            self.thread.join(timeout=3)
+        except Exception:
+            pass
+        if hasattr(self, "db") and self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+
+    def test_01_exit_instruction_stops_thread(self):
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_02_shutdown_event_stops_thread(self):
+        self.shutdown.set()
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_03_unknown_instruction_does_not_crash(self):
+        self.q.put(bytes([0xFF, 0x01, 0x02]))
+        time.sleep(0.2)
+        self.assertTrue(self.thread.is_alive())
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_04_periodic_commit(self):
+        time.sleep(5.5)
+        self.assertTrue(self.thread.is_alive())
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+
+    def test_05_db_closed_after_exit(self):
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            self.db.execute("SELECT 1")
+
+    def test_06_pragmas_set(self):
+        time.sleep(0.2)
+        journal_mode = self.db.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(journal_mode.lower(), "wal")
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+
+    def test_07_survives_keyboard_interrupt(self):
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
