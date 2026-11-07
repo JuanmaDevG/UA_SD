@@ -117,11 +117,46 @@ def decompress_instruction(i: bytes) -> SimpleNamespace | None:
         )
 
     def id_fmt(i: bytes) -> SimpleNamespace | None:
-        pass  # TODO: continue here
+        if len(i) != 2:
+            raise InsFmtException(
+                i, f"Debe tener exactamente 2 bytes, y tiene {len(i)}"
+            )
+        return SimpleNamespace(id=i[1])
+
+    inst_v = {
+        WS_REGISTER: ws_fmt,
+        SERVER_ACK_WS_LOGIN: ws_fmt,
+        WS_LOGIN: id_fmt,
+        SERVER_ACK_WS_REGISTER: id_fmt,
+    }
+    if i[0] not in inst_v:
+        raise InsFmtException(i, "Instrucción no existente")
+    return inst_v[i[0]](i)
 
 
 def compress_namespace(opcode: int, ns: SimpleNamespace) -> bytes:
-    return b""  # TODO: from ns to instruction
+    def ws_fmt() -> bytes:
+        return (
+            bytes([opcode, ns.id, ns.x, ns.y, STX])
+            + ns.name.encode()
+            + bytes([ETX, ns.state])
+        )
+
+    def id_fmt() -> bytes:
+        return bytes([opcode, ns.id])
+
+    inst_c = {
+        WS_REGISTER: ws_fmt,
+        SERVER_ACK_WS_LOGIN: ws_fmt,
+        WS_LOGIN: id_fmt,
+        SERVER_ACK_WS_REGISTER: id_fmt,
+    }
+    if opcode not in inst_c:
+        raise InsFmtException(bytes([opcode]), "Instrucción no existente")
+    try:
+        return inst_c[opcode]()
+    except (AttributeError, ValueError) as e:
+        raise InsFmtException(bytes([opcode]), str(e)) from e
 
 
 def stamp() -> str:
