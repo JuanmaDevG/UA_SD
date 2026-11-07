@@ -6,14 +6,15 @@
 import os
 from pathlib import Path
 from queue import Queue
-
+from random import randint
 import socket
 import sqlite3
 import sys
 import threading
 import time
-from random import randint
 from types import SimpleNamespace
+
+from confluent_kafka import Consumer, Producer
 
 
 USAGE_MSG = """
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS stations (
 CREATE TABLE IF NOT EXISTS operators (
     id INTEGER PRIMARY KEY,
     x INTEGER, y INTEGER,
-    name TEXT
+    name TEXT,
+    cur_station INTEGER DEFAULT NULL
 );
 """
 
@@ -78,13 +80,25 @@ SERVER_ACK_WS_REGISTER = 0x08  # bytes[0x08, id]
 
 
 # Kafka instructions
-# ...
-
-
-INSTRUCTION_NAMES = {
-    WS_REGISTER: "REGISTER_WATERING_STATION",
-    WS_LOGIN: "LOGIN_WATERING_STATION",
-}
+OP_REQ_WATERING = 0x09  # bytes[0x09, op_id, ws_id]
+WS_ANSWER_WATERING = 0x0A  # bytes[0x0A, ACK/NACK, op_id, ws_id]
+C_REQ_WATERING = 0x0B  # bytes[0x0B, ws_id]
+WS_C_ANSWER_WATERING = 0x0C  # bytes[0x0C, ACK/NACK]
+C_WS_SHUTDOWN = 0x0D  # bytes[0x0D, ws_id]
+C_OP_SHUTDOWN = 0x0E  # bytes[0x0D, ws_id]
+WS_GOODBYE = 0x0F  # bytes[0x0F, ws_id]
+OP_GOODBYE = 0x10  # bytes[0x10, op_id]
+C_PING_WS = 0x11  # bytes[0x11, ws_id]
+WS_PUBLISH_STATE = 0x12  # bytes[0x12, ws_id, state]
+OP_WATERING = 0x13  # bytes[0x13, op_id, ws_id]
+C_WATERING = 0x14  # bytes[0x14, ws_id]
+C_LS_STATIONS = 0x15  # bytes[0x15]
+C_LS_OPERATORS = 0x16  # bytes[0x16]
+C_GET_STATION = 0x17  # bytes[0x18, ws_id]
+C_GET_OPERATOR = 0x18  # bytes[0x18, op_id]
+WS_I_AM = 0x19  # bytes[0x19, op_id, x, y, STX, name (n bytes), ETX, state]
+OP_I_AM = 0x1A  # bytes[0x1A, op_id, x, y, STX, name (n bytes), ETX, cur_station]
+WS_WATERINFO = 0x1B  # bytes[0x1B]
 
 
 class InsFmtException(Exception):
@@ -94,11 +108,11 @@ class InsFmtException(Exception):
         super().__init__(f"(opcode: {i[0]}) {msg}")
 
 
-def decompress_instruction(i: bytes) -> SimpleNamespace | None:
+def decompress_instruction(i: bytes) -> SimpleNamespace:
     if not len(i):
         raise InsFmtException(i, "Empty instruction")
 
-    def ws_fmt(i: bytes) -> SimpleNamespace | None:
+    def entity_fmt(i: bytes) -> SimpleNamespace:
         name_end: int
         state: int
         if len(i) < 7:
@@ -110,24 +124,55 @@ def decompress_instruction(i: bytes) -> SimpleNamespace | None:
             raise InsFmtException(i, "Falta STX en el quinto byte")
         if (name_end := i.find(ETX, 5)) == -1:
             raise InsFmtException(i, "Falta ETX como delimitador del campo 'name'")
-        if (state := i[len(i) - 1]) not in WS_STATES:
-            raise InsFmtException(i, f"El estado de la WS con id={i[1]} no existe")
-        return SimpleNamespace(
-            id=i[1], x=i[2], y=i[3], name=i[5:name_end].decode(), state=state
-        )
+        res = SimpleNamespace(id=i[1], x=i[2], y=i[3], name=i[5:name_end].decode())
 
-    def id_fmt(i: bytes) -> SimpleNamespace | None:
+        if i[0] == OP_I_AM:
+            res.cur_station = res.state
+            del res.state
+        elif (state := i[len(i) - 1]) not in WS_STATES:
+            raise InsFmtException(i, f"El estado de la WS con id={i[1]} no existe")
+        else:
+            res.state = state
+
+        return res
+
+    def id_fmt(i: bytes) -> SimpleNamespace:
         if len(i) != 2:
             raise InsFmtException(
                 i, f"Debe tener exactamente 2 bytes, y tiene {len(i)}"
             )
         return SimpleNamespace(id=i[1])
 
+    def op_ws_fmt(i: bytes) -> SimpleNamespace:
+        raise NotImplementedError()
+
+    def ack_nack_fmt(i: bytes) -> SimpleNamespace:
+        raise NotImplementedError()
+
+    def state_publish_fmt(i: bytes) -> SimpleNamespace:
+        raise NotImplementedError()
+
     inst_v = {
-        WS_REGISTER: ws_fmt,
-        SERVER_ACK_WS_LOGIN: ws_fmt,
+        WS_REGISTER: entity_fmt,
+        SERVER_ACK_WS_LOGIN: entity_fmt,
         WS_LOGIN: id_fmt,
         SERVER_ACK_WS_REGISTER: id_fmt,
+        OP_REQ_WATERING: op_ws_fmt,
+        WS_ANSWER_WATERING: ack_nack_fmt,
+        C_REQ_WATERING: id_fmt,
+        WS_C_ANSWER_WATERING: ack_nack_fmt,
+        C_WS_SHUTDOWN: id_fmt,
+        C_OP_SHUTDOWN: id_fmt,
+        WS_GOODBYE: id_fmt,
+        OP_GOODBYE: id_fmt,
+        C_PING_WS: id_fmt,
+        WS_PUBLISH_STATE: state_publish_fmt,
+        OP_WATERING: op_ws_fmt,
+        C_WATERING: id_fmt,
+        C_GET_STATION: id_fmt,
+        C_GET_OPERATOR: id_fmt,
+        WS_I_AM: entity_fmt,
+        OP_I_AM: entity_fmt,
     }
     if i[0] not in inst_v:
         raise InsFmtException(i, "Instrucción no existente")
@@ -225,13 +270,6 @@ def getdb() -> sqlite3.Connection:
 def load_entities(
     db: sqlite3.Connection,
 ) -> tuple[dict[int, SimpleNamespace], ...]:
-    """Load entities dictionaries
-    Args:
-        db: database connection
-    Returns:
-        stations: dict[id, entity_properties]
-        operators: dict[id, entity_properties]
-    """
     db.row_factory = sqlite3.Row
 
     def extract(tbname: str) -> dict[int, SimpleNamespace]:
@@ -243,82 +281,42 @@ def load_entities(
 
 
 def ws_login(
-    data: bytes, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
+    ins: SimpleNamespace, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
 ) -> bytes:
-    if len(data) != 2:
-        return bytes([NACK])
-
-    station_id = data[1]
-    tell(OK, f"(login server) peticion de LOGIN con id={station_id}")
+    tell(OK, f"(login server) peticion de LOGIN con id={ins.id}")
 
     with ws_lock:
-        station = stations.get(station_id)
+        station = stations.get(ins.id)
 
     if station is None:
         tell(
             ERROR,
-            f"(login server) el id={station_id} no existe, debe registrarse...",
+            f"(login server) el id={ins.id} no existe, debe registrarse...",
         )
         return bytes([NACK])
 
-    return (
-        bytes(
-            [
-                SERVER_ACK_WS_LOGIN,
-                station.id,
-                station.x,
-                station.y,
-                STX,
-            ]
-        )
-        + station.name.encode("utf-8")
-        + bytes([ETX, station.state])
-    )
+    if not (station.x or station.y or station.name):
+        tell(ERROR, f"(login server) la estación {ins.id} debe actualizar sus datos...")
+        return bytes([NACK])
+
+    return compress_namespace(SERVER_ACK_WS_LOGIN, station)
 
 
 def ws_register(
-    data: bytes, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
+    ins: SimpleNamespace, stations: dict[int, SimpleNamespace], ws_lock: threading.Lock
 ) -> bytes:
-    if len(data) < 7:
-        return bytes([NACK])
-
-    station_id = data[1]
-    tell(OK, f"(login server) comando REGISTER con id={station_id}")
-
-    name_end = data.find(ETX, 5)
-    if data[4] != STX or name_end == -1 or name_end + 1 >= len(data):
-        tell(
-            ERROR,
-            f"(login server) registro para id={station_id} formato incorrecto de "
-            "argumentos, falta STX y/o ETX en el campo <name>",
-        )
-        return bytes([NACK])
-
-    try:
-        name = data[5:name_end].decode("utf-8")
-    except UnicodeDecodeError:
-        tell(
-            ERROR,
-            f"(login server) registro para id={station_id}: <name> no es UTF-8 valido",
-        )
-        return bytes([NACK])
+    tell(OK, f"(login server) comando REGISTER con id={ins.id}")
 
     with ws_lock:
-        if station_id in stations:
+        if ins.id in stations:
             tell(
                 WARNING,
-                f"(login server) el id={station_id} ya estaba registrado, "
+                f"(login server) el id={ins.id} ya estaba registrado, "
                 "actualizando datos...",
             )
-        stations[station_id] = SimpleNamespace(
-            id=station_id,
-            name=name,
-            state=data[name_end + 1],
-            x=data[2],
-            y=data[3],
-        )
+        stations[ins.id] = ins
 
-    return bytes([SERVER_ACK_WS_REGISTER, station_id])
+    return compress_namespace(SERVER_ACK_WS_REGISTER, ins)
 
 
 def login_server(
@@ -360,13 +358,12 @@ def login_server(
                     conn.sendall(bytes([NACK]))
                     continue
                 try:
-                    response = instructions[data[0]](data, stations, ws_lock)
-                except IndexError as ierr:
+                    ins = decompress_instruction(data)
+                    response = instructions[data[0]](ins, stations, ws_lock)
+                except (InsFmtException, UnicodeDecodeError) as err:
                     tell(
                         ERROR,
-                        f"(login server) instruccion malformada "
-                        f"{INSTRUCTION_NAMES[data[0]]} de {addr} "
-                        f"{ierr}",
+                        f"(login server) {addr} {err}",
                     )
                     response = bytes([NACK])
                 conn.sendall(response)
@@ -384,8 +381,7 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute("PRAGMA busy_timeout=5000")
-    changes = db.cursor()
-    changes.execute("BEGIN")
+    db.execute("BEGIN")
     try:
         start = time.monotonic()
         while not shutdown_event.is_set():
@@ -393,23 +389,79 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
             if ins[0] == EXIT:
                 break
 
-            if ins[0] == WS_REGISTER:
-                r = db.execute(
-                    "SELECT id FROM stations WHERE id = ?", (ins[1],)
-                ).fetchone()
-                if r is None:
-                    db.execute("INSERT INTO stations VALUES (?,?,?,?,?)")
-                db.execute("")
-            elif ins[0] == WS_LOGIN:
-                db.execute("")
-            # TODO: apply kafka instructions when available
+            try:
+                if ins[0] == WS_REGISTER or ins[0] == WS_I_AM:
+                    ns = decompress_instruction(ins)
+                    r = db.execute(
+                        "SELECT id FROM stations WHERE id = ?", (ns.id,)
+                    ).fetchone()
+                    if r is None:
+                        db.execute(
+                            "INSERT INTO stations VALUES (?,?,?,?,?)",
+                            (ns.id, ns.x, ns.y, ns.name, ns.state),
+                        )
+                        tell(
+                            OK,
+                            f"(watchdog) added watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE stations SET x = ?, y = ?, name = ?,"
+                            "state = ? WHERE id = ?",
+                            (ns.x, ns.y, ns.name, ns.state, ns.id),
+                        )
+                        tell(
+                            WARNING,
+                            f"(watchdog) updated watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
+                        )
+                elif ins[0] == WS_LOGIN:
+                    r = db.execute(
+                        "SELECT * FROM stations WHERE id = ?", (ins[1],)
+                    ).fetchone()
+                    if r is None:
+                        tell(
+                            WARNING,
+                            f"(watchdog) an unkown station ({ins[1]})was trying to log into the database, ignoring...",
+                        )
+                elif ins[0] == WS_PUBLISH_STATE:
+                    ws = decompress_instruction(ins)
+                    tell(
+                        OK,
+                        f"(watchdog) updating station {ws.id} to {WS_STATE_NAMES[ws.state]}...",
+                    )
+                    cursor = db.execute(
+                        "UPDATE stations SET state = ? WHERE id = ?", (ws.state, ws.id)
+                    )
+                    if cursor.rowcount == 0:
+                        tell(
+                            ERROR,
+                            f"The station {ws.id} does not exist in the database",
+                        )
+                elif ins[0] == OP_I_AM:
+                    op = decompress_instruction(ins)
+                    tell(OK, f"(watchdog) updating operator {op.x}")
+                    cur = db.execute(
+                        "UPDATE operators SET x = ?, y = ?, name = ?, cur_station = ? WHERE id = ?",
+                        (op.x, op.y, op.name, op.cur_station, op.id),
+                    )
+                    if cur.rowcount == 0:
+                        db.execute(
+                            "INSERT INTO operators VALUES (?,?,?,?,?)",
+                            (op.id, op.x, op.y, op.name, op.cur_station),
+                        )
+                        tell(
+                            WARNING,
+                            f"(watchdog) new operator {op.id}: {op.name} ({op.x},{op.y})",
+                        )
+            except InsFmtException as err:
+                tell(ERROR, str(err))
 
             if time.monotonic() - start >= 5.0:
                 tell(OK, "(watchdog) updating database...")
                 db.commit()
                 tell(OK, "(watchdog) database updated")
                 start = time.monotonic()
-                changes.execute("BEGIN")
+                db.execute("BEGIN")
 
     except (KeyboardInterrupt, SystemExit):
         tell(OK, "(watchdog) main thread system exit, quitting...")
@@ -423,6 +475,7 @@ def run_kafka(
     stations: dict[int, SimpleNamespace],
     operators: dict[int, SimpleNamespace],
     watchdog_queue: Queue[bytes],
+    ui_queue: Queue[bytes],
 ) -> None:
     # Consumer + Producer
     # Answer to events and instructions
@@ -432,7 +485,7 @@ def run_kafka(
 # ui_server helpers
 
 
-def ui_server():
+def ui_server(ui_queue: Queue[bytes]):
     pass
 
 
@@ -470,7 +523,8 @@ def main(*args):
         daemon=True,
     ).start()
 
-    run_kafka(kafka, stations, operators, watchdog_queue)
+    ui_queue = Queue()
+    run_kafka(kafka, stations, operators, watchdog_queue, ui_queue)
 
 
 if __name__ == "__main__":

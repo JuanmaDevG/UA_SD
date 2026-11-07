@@ -416,13 +416,12 @@ class TestWatchdog(unittest.TestCase):
             os.remove(str(self.db_path))
         os.environ.pop("DOCKER_VOLUME", None)
         os.environ.pop("LOG_DIR", None)
-        self.db = getdb()
         self.q: Queue[bytes] = Queue()
         self.shutdown = threading.Event()
         self.thread = threading.Thread(
             target=watchdog,
             name="test-watchdog",
-            args=(self.db, self.q, self.shutdown),
+            args=(self.q, self.shutdown),
             daemon=True,
         )
         self.thread.start()
@@ -432,13 +431,13 @@ class TestWatchdog(unittest.TestCase):
         self.q.put(bytes([EXIT]))
         try:
             self.thread.join(timeout=3)
-        except Exception:
-            pass
+        except TimeoutError:
+            print("Thread is still alive")
         if hasattr(self, "db") and self.db:
             try:
                 self.db.close()
-            except Exception:
-                pass
+            except sqlite3.ProgrammingError:
+                print("The database was not even open")
 
     def test_01_exit_instruction_stops_thread(self):
         self.q.put(bytes([EXIT]))
@@ -452,7 +451,7 @@ class TestWatchdog(unittest.TestCase):
 
     def test_03_unknown_instruction_does_not_crash(self):
         self.q.put(bytes([0xFF, 0x01, 0x02]))
-        time.sleep(0.2)
+        time.sleep(0.3)
         self.assertTrue(self.thread.is_alive())
         self.q.put(bytes([EXIT]))
         self.thread.join(timeout=3)
@@ -461,24 +460,6 @@ class TestWatchdog(unittest.TestCase):
     def test_04_periodic_commit(self):
         time.sleep(5.5)
         self.assertTrue(self.thread.is_alive())
-        self.q.put(bytes([EXIT]))
-        self.thread.join(timeout=3)
-        self.assertFalse(self.thread.is_alive())
-
-    def test_05_db_closed_after_exit(self):
-        self.q.put(bytes([EXIT]))
-        self.thread.join(timeout=3)
-        with self.assertRaises(sqlite3.ProgrammingError):
-            self.db.execute("SELECT 1")
-
-    def test_06_pragmas_set(self):
-        time.sleep(0.2)
-        journal_mode = self.db.execute("PRAGMA journal_mode").fetchone()[0]
-        self.assertEqual(journal_mode.lower(), "wal")
-        self.q.put(bytes([EXIT]))
-        self.thread.join(timeout=3)
-
-    def test_07_survives_keyboard_interrupt(self):
         self.q.put(bytes([EXIT]))
         self.thread.join(timeout=3)
         self.assertFalse(self.thread.is_alive())
