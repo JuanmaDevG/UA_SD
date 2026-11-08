@@ -17,6 +17,8 @@ from types import SimpleNamespace
 from confluent_kafka import Consumer, Producer
 
 
+KAFKA_TOPIC = "water.management"
+
 USAGE_MSG = """
 Usage:
     WM_Central <login_port> <kafka_host>:<kafka_port>
@@ -498,19 +500,132 @@ def run_kafka(
     kafka: str,
     stations: dict[int, SimpleNamespace],
     operators: dict[int, SimpleNamespace],
+    ws_lock: threading.Lock,
     watchdog_queue: Queue[bytes],
-    ui_queue: Queue[bytes],
+    ui_out: Queue[bytes],
+    ui_input: Queue[bytes],
+    shutdown_event: threading.Event,
 ) -> None:
-    # Consumer + Producer
-    # Assume project is done
-    # Answer to events and instructions
-    pass
+    producer = Producer({"bootstrap.servers": kafka, "client.id": "wm-central"})
+    consumer = Consumer(
+        {
+            "bootstrap.servers": kafka,
+            "group.id": "wm-central",
+            "auto.offset.reset": "earliest",
+        }
+    )
+    consumer.subscribe([KAFKA_TOPIC])
+
+    # TODO: why should I use a key?
+    def send(topic: str, key: int | None, data: bytes) -> None:
+        producer.produce(topic, data, key=None if key is None else bytes([key]))
+        producer.poll(0)
+
+    def set_state(ws_id: int, state: int) -> None:
+        with ws_lock:
+            station = stations.get(ws_id)
+            if station is None:
+                tell(ERROR, f"(kafka) la estación {ws_id} no existe")
+                return
+            station.state = state
+        ins = bytes([WS_PUBLISH_STATE, ws_id, state])
+        watchdog_queue.put(ins)
+        ui_out.put(ins)
+        send(KAFKA_TOPIC, ws_id, ins)
+        tell(OK, f"(kafka) estación {ws_id} -> {WS_STATE_NAMES[state]}")
+
+    def op_req_watering(ins: SimpleNamespace, raw: bytes) -> None:
+        with ws_lock:
+            station = stations.get(ins.ws_id)
+            available = station is not None and station.state == AVAILABLE
+        if ins.op_id not in operators or not available:
+            tell(
+                WARNING,
+                f"(kafka) riego denegado: operador {ins.op_id} -> estación {ins.ws_id}",
+            )
+            send(
+                KAFKA_TOPIC,
+                ins.op_id,
+                bytes([WS_ANSWER_WATERING, NACK, ins.op_id, ins.ws_id]),
+            )
+            return
+        send(KAFKA_TOPIC, ins.ws_id, raw)
+
+    def ws_answer_watering(ins: SimpleNamespace, raw: bytes) -> None:
+        send(KAFKA_TOPIC, ins.op_id, raw)
+        if ins.ack == ACK:
+            set_state(ins.ws_id, WATERING)
+
+    def publish_state(ins: SimpleNamespace, raw: bytes) -> None:
+        set_state(ins.id, ins.state)
+
+    def ws_i_am(ins: SimpleNamespace, raw: bytes) -> None:
+        with ws_lock:
+            stations[ins.id] = ins
+        watchdog_queue.put(raw)
+        ui_out.put(raw)
+        send(KAFKA_TOPIC, ins.id, bytes([WS_PUBLISH_STATE, ins.id, ins.state]))
+
+    def op_i_am(ins: SimpleNamespace, raw: bytes) -> None:
+        operators[ins.id] = ins
+        watchdog_queue.put(raw)
+        ui_out.put(raw)
+
+    def ws_goodbye(ins: SimpleNamespace, raw: bytes) -> None:
+        set_state(ins.id, DISCONNECTED)
+
+    def op_goodbye(ins: SimpleNamespace, raw: bytes) -> None:
+        tell(OK, f"(kafka) el operador {ins.id} se ha desconectado")
+        ui_out.put(raw)
+
+    def to_ui(ins: SimpleNamespace, raw: bytes) -> None:
+        ui_out.put(raw)
+
+    handlers = {
+        OP_REQ_WATERING: op_req_watering,
+        WS_ANSWER_WATERING: ws_answer_watering,
+        WS_PUBLISH_STATE: publish_state,
+        WS_I_AM: ws_i_am,
+        OP_I_AM: op_i_am,
+        WS_GOODBYE: ws_goodbye,
+        OP_GOODBYE: op_goodbye,
+        OP_WATERING: to_ui,
+    }
+
+    tell(OK, f"(kafka) escuchando en {KAFKA_TOPIC}@{kafka}")
+    try:
+        while not shutdown_event.is_set():
+            msg = consumer.poll(0.5)
+            if msg is None:
+                continue
+            if msg.error():
+                tell(ERROR, f"(kafka) {msg.error()}")
+                continue
+            raw = msg.value()
+            if raw and raw[0] == WS_WATERINFO and len(raw) == 4:
+                ui_out.put(raw)  # not handled by decompress_instruction yet
+                continue
+            if not raw or raw[0] not in handlers:
+                tell(ERROR, f"(kafka) instrucción no soportada: {raw!r}")
+                continue
+            try:
+                handlers[raw[0]](decompress_instruction(raw), raw)
+            except InsFmtException as err:
+                tell(ERROR, f"(kafka) {err}")
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        tell(OK, "(kafka) Saliendo...")
+        shutdown_event.set()
+        watchdog_queue.put(bytes([EXIT]))
+        consumer.close()
+        producer.flush(5)
 
 
 # ui_server helpers
 
 
-def ui_server(ui_queue: Queue[bytes]):
+def ui_server(ui_out: Queue[bytes]):
     pass
 
 
@@ -548,8 +663,17 @@ def main(*args):
         daemon=True,
     ).start()
 
-    ui_queue = Queue()
-    run_kafka(kafka, stations, operators, watchdog_queue, ui_queue)
+    ui_in, ui_out = Queue(), Queue()
+    run_kafka(
+        kafka,
+        stations,
+        operators,
+        ws_lock,
+        watchdog_queue,
+        ui_out,
+        ui_in,
+        shutdown_event,
+    )
 
 
 if __name__ == "__main__":
