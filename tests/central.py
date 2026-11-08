@@ -10,7 +10,7 @@ import psutil
 import time
 
 from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
-from WM_Central import STX, ETX, NACK, WATERING
+from WM_Central import FLUSH_DB, STX, ETX, NACK, WATERING
 
 # Import functions to test
 from WM_Central import get_netparams
@@ -27,7 +27,13 @@ from WM_Central import (
     SERVER_ACK_WS_REGISTER,
     login_server,
 )
-from WM_Central import EXIT, watchdog
+from WM_Central import (
+    EXIT,
+    WS_I_AM,
+    OP_I_AM,
+    WS_PUBLISH_STATE,
+    watchdog,
+)
 
 
 class TestParams(unittest.TestCase):
@@ -439,6 +445,37 @@ class TestWatchdog(unittest.TestCase):
             except sqlite3.ProgrammingError:
                 print("The database was not even open")
 
+    def flush(self) -> None:
+        self.q.put(bytes([FLUSH_DB]))
+        time.sleep(0.3)
+
+    def query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        self.db = sqlite3.connect(self.db_path)
+        try:
+            return self.db.execute(sql, params).fetchall()
+        finally:
+            self.db.close()
+
+    def station(self, i: int) -> tuple | None:
+        r = self.query("SELECT id, x, y, name, state FROM stations WHERE id = ?", (i,))
+        return r[0] if r else None
+
+    def operator(self, i: int) -> tuple | None:
+        r = self.query(
+            "SELECT id, x, y, name, cur_station FROM operators WHERE id = ?", (i,)
+        )
+        return r[0] if r else None
+
+    @staticmethod
+    def ws(opcode: int, id: int, x: int, y: int, name: str, state: int) -> bytes:
+        return bytes([opcode, id, x, y, STX]) + name.encode() + bytes([ETX, state])
+
+    @staticmethod
+    def op(id: int, x: int, y: int, name: str, cur_station: int) -> bytes:
+        return (
+            bytes([OP_I_AM, id, x, y, STX]) + name.encode() + bytes([ETX, cur_station])
+        )
+
     def test_01_exit_instruction_stops_thread(self):
         self.q.put(bytes([EXIT]))
         self.thread.join(timeout=3)
@@ -458,8 +495,89 @@ class TestWatchdog(unittest.TestCase):
         self.assertFalse(self.thread.is_alive())
 
     def test_04_periodic_commit(self):
-        time.sleep(5.5)
+        time.sleep(1)
         self.assertTrue(self.thread.is_alive())
         self.q.put(bytes([EXIT]))
         self.thread.join(timeout=3)
         self.assertFalse(self.thread.is_alive())
+
+    def test_05_register_inserts_station(self):
+        self.q.put(self.ws(WS_REGISTER, 7, 10, 20, "Norte", AVAILABLE))
+        self.flush()
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(self.station(7), (7, 10, 20, "Norte", AVAILABLE))
+
+    def test_06_register_updates_station(self):
+        self.q.put(self.ws(WS_REGISTER, 7, 10, 20, "Norte", AVAILABLE))
+        self.q.put(self.ws(WS_REGISTER, 7, 11, 21, "Norte 2", LEAK))
+        self.flush()
+        self.assertEqual(self.station(7), (7, 11, 21, "Norte 2", LEAK))
+        self.assertEqual(len(self.query("SELECT * FROM stations")), 1)
+
+    def test_07_ws_i_am_inserts_and_updates(self):
+        self.q.put(self.ws(WS_I_AM, 3, 1, 2, "Sur", WATERING))
+        self.q.put(self.ws(WS_I_AM, 3, 1, 2, "Sur", OUT_OF_SERVICE))
+        self.flush()
+        self.assertEqual(self.station(3), (3, 1, 2, "Sur", OUT_OF_SERVICE))
+
+    def test_08_login_unknown_station_does_not_crash(self):
+        self.q.put(bytes([WS_LOGIN, 99]))
+        time.sleep(0.3)
+        self.assertTrue(self.thread.is_alive())
+        self.assertIsNone(self.station(99))
+
+    def test_09_login_known_station_keeps_data(self):
+        self.q.put(self.ws(WS_REGISTER, 4, 5, 6, "Este", AVAILABLE))
+        self.q.put(bytes([WS_LOGIN, 4]))
+        self.flush()
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(self.station(4), (4, 5, 6, "Este", AVAILABLE))
+
+    def test_10_publish_state_updates_station(self):
+        self.q.put(self.ws(WS_REGISTER, 2, 0, 0, "Oeste", AVAILABLE))
+        self.q.put(bytes([WS_PUBLISH_STATE, 2, LEAK]))
+        self.flush()
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(self.station(2), (2, 0, 0, "Oeste", LEAK))
+
+    def test_11_publish_state_unknown_station_does_not_crash(self):
+        self.q.put(bytes([WS_PUBLISH_STATE, 50, LEAK]))
+        self.flush()
+        self.assertTrue(self.thread.is_alive())
+        self.assertIsNone(self.station(50))
+
+    def test_12_operator_i_am_updates_existing(self):
+        self.q.put(self.op(1, 30, 40, FIELD_OPERATORS[0], 9))
+        self.flush()
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(self.operator(1), (1, 30, 40, FIELD_OPERATORS[0], 9))
+
+    def test_13_operator_i_am_inserts_new(self):
+        self.q.put(self.op(20, 1, 1, "Nuevo", 3))
+        self.flush()
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(self.operator(20), (20, 1, 1, "Nuevo", 3))
+
+    def test_14_malformed_instructions_do_not_crash(self):
+        for ins in (
+            bytes([WS_REGISTER, 1, 2]),  # too short
+            bytes([WS_REGISTER, 1, 2, 3, 0x00, 65, ETX, AVAILABLE]),  # no STX
+            bytes([WS_REGISTER, 1, 2, 3, STX, 65, 66, AVAILABLE]),  # no ETX
+            bytes([WS_REGISTER, 1, 2, 3, STX, 65, ETX, 0xEE]),  # bad state
+            bytes([WS_REGISTER, 1, 2, 3, STX, 0xFF, ETX, AVAILABLE]),  # bad utf-8
+            bytes([WS_LOGIN]),
+            bytes([WS_PUBLISH_STATE, 1]),
+            bytes([WS_PUBLISH_STATE, 1, 0xEE]),
+        ):
+            self.q.put(ins)
+        time.sleep(0.3)
+        self.assertTrue(self.thread.is_alive())
+        self.flush()
+        self.assertEqual(self.query("SELECT * FROM stations"), [])
+
+    def test_15_exit_commits_pending_changes(self):
+        self.q.put(self.ws(WS_REGISTER, 8, 1, 1, "Final", AVAILABLE))
+        self.q.put(bytes([EXIT]))
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.station(8), (8, 1, 1, "Final", AVAILABLE))

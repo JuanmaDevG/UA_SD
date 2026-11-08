@@ -92,45 +92,50 @@ C_PING_WS = 0x11  # bytes[0x11, ws_id]
 WS_PUBLISH_STATE = 0x12  # bytes[0x12, ws_id, state]
 OP_WATERING = 0x13  # bytes[0x13, op_id, ws_id]
 C_WATERING = 0x14  # bytes[0x14, ws_id]
-C_LS_STATIONS = 0x15  # bytes[0x15]
-C_LS_OPERATORS = 0x16  # bytes[0x16]
+LS_STATIONS = 0x15  # bytes[0x15]
+LS_OPERATORS = 0x16  # bytes[0x16]
 C_GET_STATION = 0x17  # bytes[0x18, ws_id]
 C_GET_OPERATOR = 0x18  # bytes[0x18, op_id]
 WS_I_AM = 0x19  # bytes[0x19, op_id, x, y, STX, name (n bytes), ETX, state]
 OP_I_AM = 0x1A  # bytes[0x1A, op_id, x, y, STX, name (n bytes), ETX, cur_station]
-WS_WATERINFO = 0x1B  # bytes[0x1B]
+WS_WATERINFO = 0x1B  # bytes[0x1B, ws_id, liters_per_minute, accum]
+FLUSH_DB = 0x1C  # bytes[0x1C]
 
 
+# TODO: make it print instruction formats automatically
 class InsFmtException(Exception):
-    def __init__(self, i: bytes, msg: str = "") -> None:
+    def __init__(self, i: bytes, msg: str | Exception = "") -> None:
         self.instruction = i
-        self.msg = msg
-        super().__init__(f"(opcode: {i[0]}) {msg}")
+        self.msg = str(msg)
+        super().__init__(f"(opcode: {i[0]}) {msg} (tiene {len(i)} bytes)")
 
 
 def decompress_instruction(i: bytes) -> SimpleNamespace:
     if not len(i):
-        raise InsFmtException(i, "Empty instruction")
+        raise InsFmtException(i, "instrucción vacía")
 
     def entity_fmt(i: bytes) -> SimpleNamespace:
         name_end: int
         state: int
         if len(i) < 7:
             raise InsFmtException(
-                i,
-                f"Este opcode debe tener tener 7 bytes o mas, y tiene {len(i)}",
+                i, "debe tener 7+ bytes (id, x, y, STX, name (n bytes), ETX, infobyte)"
             )
         if i[4] != STX:
-            raise InsFmtException(i, "Falta STX en el quinto byte")
+            raise InsFmtException(i, "falta STX en el quinto byte")
         if (name_end := i.find(ETX, 5)) == -1:
-            raise InsFmtException(i, "Falta ETX como delimitador del campo 'name'")
-        res = SimpleNamespace(id=i[1], x=i[2], y=i[3], name=i[5:name_end].decode())
+            raise InsFmtException(i, "falta ETX como delimitador del campo 'name'")
+        try:
+            res = SimpleNamespace(id=i[1], x=i[2], y=i[3], name=i[5:name_end].decode())
+        except UnicodeError as err:
+            raise InsFmtException(i, err)
 
         if i[0] == OP_I_AM:
-            res.cur_station = res.state
-            del res.state
+            res.cur_station = i[len(i) - 1]
         elif (state := i[len(i) - 1]) not in WS_STATES:
-            raise InsFmtException(i, f"El estado de la WS con id={i[1]} no existe")
+            raise InsFmtException(
+                i, f"el estado de la estación con id={i[1]} no existe"
+            )
         else:
             res.state = state
 
@@ -138,19 +143,35 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
 
     def id_fmt(i: bytes) -> SimpleNamespace:
         if len(i) != 2:
-            raise InsFmtException(
-                i, f"Debe tener exactamente 2 bytes, y tiene {len(i)}"
-            )
+            raise InsFmtException(i, "Debe tener 2 bytes (opcode, id)")
         return SimpleNamespace(id=i[1])
 
     def op_ws_fmt(i: bytes) -> SimpleNamespace:
-        raise NotImplementedError()
+        if len(i) != 3:
+            raise InsFmtException(i, "debe tener 3 bytes (opcode, op_id, ws_id)")
+        return SimpleNamespace(op_id=i[1], ws_id=i[2])
 
     def ack_nack_fmt(i: bytes) -> SimpleNamespace:
-        raise NotImplementedError()
+        res: SimpleNamespace
+        if i[0] == WS_C_ANSWER_WATERING:
+            if len(i) != 2:
+                raise InsFmtException(i, "debe tener 2 bytes (opcode, ACK/NACK)")
+            res = SimpleNamespace(ack=i[2])
+        elif len(i) != 4:
+            raise InsFmtException(
+                i, "debe tener 4 bytes (opcode, ACK/NACK, op_id, station_id)"
+            )
+        res = SimpleNamespace(ack=i[1], op_id=i[2], ws_id=i[3])
+        return res
 
     def state_publish_fmt(i: bytes) -> SimpleNamespace:
-        raise NotImplementedError()
+        if len(i) != 3:
+            raise InsFmtException(i, "debe tener 3 bytes (opcode, id, estado)")
+        if i[2] >= len(WS_STATE_NAMES):
+            raise InsFmtException(
+                i, f"id={i[1]} tiene un estado inexistente con código {i[2]}"
+            )
+        return SimpleNamespace(id=i[1], state=i[2])
 
     inst_v = {
         WS_REGISTER: entity_fmt,
@@ -175,7 +196,9 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
         OP_I_AM: entity_fmt,
     }
     if i[0] not in inst_v:
-        raise InsFmtException(i, "Instrucción no existente")
+        if len(i) == 1:
+            return SimpleNamespace(opcode=i[0])
+        raise InsFmtException(i, "instrucción inexistente")
     return inst_v[i[0]](i)
 
 
@@ -378,7 +401,7 @@ def login_server(
 
 def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
     db = getdb()
-    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA journal_mode=EXCLUSIVE")
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("BEGIN")
@@ -389,84 +412,85 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
             if ins[0] == EXIT:
                 break
 
+            ns: SimpleNamespace
             try:
-                if ins[0] == WS_REGISTER or ins[0] == WS_I_AM:
-                    ns = decompress_instruction(ins)
-                    r = db.execute(
-                        "SELECT id FROM stations WHERE id = ?", (ns.id,)
-                    ).fetchone()
-                    if r is None:
-                        db.execute(
-                            "INSERT INTO stations VALUES (?,?,?,?,?)",
-                            (ns.id, ns.x, ns.y, ns.name, ns.state),
-                        )
-                        tell(
-                            OK,
-                            f"(watchdog) added watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
-                        )
-                    else:
-                        db.execute(
-                            "UPDATE stations SET x = ?, y = ?, name = ?,"
-                            "state = ? WHERE id = ?",
-                            (ns.x, ns.y, ns.name, ns.state, ns.id),
-                        )
-                        tell(
-                            WARNING,
-                            f"(watchdog) updated watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
-                        )
-                elif ins[0] == WS_LOGIN:
-                    r = db.execute(
-                        "SELECT * FROM stations WHERE id = ?", (ins[1],)
-                    ).fetchone()
-                    if r is None:
-                        tell(
-                            WARNING,
-                            f"(watchdog) an unkown station ({ins[1]})was trying to log into the database, ignoring...",
-                        )
-                elif ins[0] == WS_PUBLISH_STATE:
-                    ws = decompress_instruction(ins)
-                    tell(
-                        OK,
-                        f"(watchdog) updating station {ws.id} to {WS_STATE_NAMES[ws.state]}...",
-                    )
-                    cursor = db.execute(
-                        "UPDATE stations SET state = ? WHERE id = ?", (ws.state, ws.id)
-                    )
-                    if cursor.rowcount == 0:
-                        tell(
-                            ERROR,
-                            f"The station {ws.id} does not exist in the database",
-                        )
-                elif ins[0] == OP_I_AM:
-                    op = decompress_instruction(ins)
-                    tell(OK, f"(watchdog) updating operator {op.x}")
-                    cur = db.execute(
-                        "UPDATE operators SET x = ?, y = ?, name = ?, cur_station = ? WHERE id = ?",
-                        (op.x, op.y, op.name, op.cur_station, op.id),
-                    )
-                    if cur.rowcount == 0:
-                        db.execute(
-                            "INSERT INTO operators VALUES (?,?,?,?,?)",
-                            (op.id, op.x, op.y, op.name, op.cur_station),
-                        )
-                        tell(
-                            WARNING,
-                            f"(watchdog) new operator {op.id}: {op.name} ({op.x},{op.y})",
-                        )
+                ns = decompress_instruction(ins)
             except InsFmtException as err:
                 tell(ERROR, str(err))
+                continue
 
-            if time.monotonic() - start >= 5.0:
+            if ins[0] == WS_REGISTER or ins[0] == WS_I_AM:
+                r = db.execute(
+                    "SELECT id FROM stations WHERE id = ?", (ns.id,)
+                ).fetchone()
+                if r is None:
+                    db.execute(
+                        "INSERT INTO stations VALUES (?,?,?,?,?)",
+                        (ns.id, ns.x, ns.y, ns.name, ns.state),
+                    )
+                    tell(
+                        OK,
+                        f"(watchdog) added watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
+                    )
+                else:
+                    db.execute(
+                        "UPDATE stations SET x = ?, y = ?, name = ?,"
+                        "state = ? WHERE id = ?",
+                        (ns.x, ns.y, ns.name, ns.state, ns.id),
+                    )
+                    tell(
+                        WARNING,
+                        f"(watchdog) updated watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
+                    )
+            elif ins[0] == WS_LOGIN:
+                r = db.execute(
+                    "SELECT * FROM stations WHERE id = ?", (ns.id,)
+                ).fetchone()
+                if r is None:
+                    tell(
+                        WARNING,
+                        f"(watchdog) an unkown station ({ns.id})was trying to log into the database, ignoring...",
+                    )
+            elif ins[0] == WS_PUBLISH_STATE:
+                tell(
+                    OK,
+                    f"(watchdog) updating station {ns.id} to {WS_STATE_NAMES[ns.state]}...",
+                )
+                cursor = db.execute(
+                    "UPDATE stations SET state = ? WHERE id = ?", (ns.state, ns.id)
+                )
+                if cursor.rowcount == 0:
+                    tell(
+                        ERROR,
+                        f"The station {ns.id} does not exist in the database",
+                    )
+            elif ins[0] == OP_I_AM:
+                tell(OK, f"(watchdog) updating operator {ns.x}")
+                cur = db.execute(
+                    "UPDATE operators SET x = ?, y = ?, name = ?, cur_station = ? WHERE id = ?",
+                    (ns.x, ns.y, ns.name, ns.cur_station, ns.id),
+                )
+                if cur.rowcount == 0:
+                    db.execute(
+                        "INSERT INTO operators VALUES (?,?,?,?,?)",
+                        (ns.id, ns.x, ns.y, ns.name, ns.cur_station),
+                    )
+                    tell(
+                        WARNING,
+                        f"(watchdog) new operator {ns.id}: {ns.name} ({ns.x},{ns.y})",
+                    )
+
+            if time.monotonic() - start >= 1.0 or ins[0] == FLUSH_DB:
                 tell(OK, "(watchdog) updating database...")
                 db.commit()
                 tell(OK, "(watchdog) database updated")
-                start = time.monotonic()
                 db.execute("BEGIN")
+                start = time.monotonic()
 
     except (KeyboardInterrupt, SystemExit):
-        tell(OK, "(watchdog) main thread system exit, quitting...")
-        db.commit()
+        tell(OK, "(watchdog) main thread signaling system exit, quitting...")
     finally:
+        db.commit()
         db.close()
 
 
@@ -478,6 +502,7 @@ def run_kafka(
     ui_queue: Queue[bytes],
 ) -> None:
     # Consumer + Producer
+    # Assume project is done
     # Answer to events and instructions
     pass
 
