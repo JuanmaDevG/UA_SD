@@ -555,7 +555,6 @@ def run_kafka(
 
             if topic == T_WATERING_REQUESTS:
                 if opcode == OP_REQ_WATERING and len(raw) == 3:
-                    # [OP_REQ_WATERING, op_id, ws_id]
                     op_id, ws_id = raw[1], raw[2]
                     with ws_lock:
                         station = stations.get(ws_id)
@@ -573,7 +572,6 @@ def run_kafka(
                             key=bytes([op_id]),
                         )
                 elif opcode == OP_WATERING and len(raw) == 3:
-                    # [OP_WATERING, op_id, ws_id]
                     ui_out.put(raw)
                 else:
                     tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
@@ -664,9 +662,6 @@ def run_kafka(
         watchdog_queue.put(bytes([EXIT]))
         consumer.close()
         producer.flush(3)
-
-
-# ui_server helpers
 
 
 def ui_server(ui_out: Queue[bytes]):
