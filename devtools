@@ -29,17 +29,17 @@ Commands:
   manager <option>  - Manage this project development environment
     <option>:
       build              - Build the container (image 'wm')
-      run <module> [...] - Run a module in the container (host network), e.g. manager run WM_FO localhost:9092 FO-01
+      run <module> [...] - Run a module in the container (host network), e.g. manager run WM_Central/WM_Central.py 5000 localhost:9092
       setup              - Create the py virtual environment and download kafka
       reset              - Reset py virtual environment and kafka installation
   kafka <option>    - Local Kafka broker (needs Java 17+)
-    <option>:  start | stop | topics | clean
+    <option>:  start | stop | topics | mktopics | clean
   Run modules locally (broker: \$WM_KAFKA, central port: \$WM_PORT):
-  wm_central                         - CENTRAL (panel at http://localhost:8080)
-  wm_ws <id> [name] [x] [y]          - Monitor (background, log in .log/) + Engine (foreground menu)
-  wm_monitor <id> [name] [x] [y]     - Monitor only (port 6000+id)
-  wm_engine <id>                     - Engine only (connects to monitor port 6000+id)
-  wm_fo <operator_id> [file]         - Field Operator, e.g. wm_fo FO-01 services.txt
+  wm_central                - CENTRAL (database in .log/wm.db)
+  wm_fo <op_id> [file]      - Field Operator, e.g. wm_fo 1 services.txt
+  wm_ws_m <port> <id> [name x y] - Station monitor, e.g. wm_ws_m 6001 1 "River Park" 10 20
+  wm_ws_e <port>            - Station engine, connects to the monitor on localhost:<port>
+  wm_tests [TestCase]       - Run the test suite (or one test case); -l lists them
 EOT
 )
 
@@ -58,7 +58,7 @@ manager() {
   build) docker build -t wm . ;;
   run)
     if [ $# -lt 1 ]; then
-      echo "manager: usage: manager run <WM_Central|WM_FO|WM_WS_E|WM_WS_M> [args...]"
+      echo "manager: usage: manager run <WM_Central/WM_Central.py|WM_FO/WM_FO.py|WM_WS/WM_WS_M.py|WM_WS/WM_WS_E.py> [args...]"
     else
       docker run --rm -it --network host wm "$@"
     fi
@@ -131,6 +131,12 @@ kafka() {
   topics)
     "$K/bin/kafka-topics.sh" --bootstrap-server "$WM_KAFKA" --list
     ;;
+  mktopics)
+    local t
+    for t in watering-requests op-control ws-control ws-state op-state; do
+      "$K/bin/kafka-topics.sh" --bootstrap-server "$WM_KAFKA" --create --if-not-exists --topic "$t"
+    done
+    ;;
   clean)
     kafka stop
     sleep 2
@@ -138,43 +144,30 @@ kafka() {
     echo "kafka: data removed"
     ;;
   *)
-    echo "kafka: usage: kafka <start|stop|topics|clean>"
+    echo "kafka: usage: kafka <start|stop|topics|mktopics|clean>"
     ;;
   esac
 }
 
 # --- run the modules locally (inside the virtual environment) -----------------
 wm_central() {
-  (cd "$PROJECT_DIR" && WM_VOLUME="${WM_VOLUME:-$PROJECT_DIR/.log}" python3 WM.py WM_Central "$WM_PORT" "$WM_KAFKA")
-}
-
-wm_monitor() {
-  local id=${1:?usage: wm_monitor <id> [name] [x] [y]}
-  shift
-  (cd "$PROJECT_DIR" && python3 WM.py WM_WS_M $((6000 + id)) "localhost:$WM_PORT" "$id" "$@")
-}
-
-wm_engine() {
-  local id=${1:?usage: wm_engine <id>}
-  (cd "$PROJECT_DIR" && python3 WM.py WM_WS_E "$WM_KAFKA" "localhost:$((6000 + id))")
-}
-
-wm_ws() {
-  local id=${1:?usage: wm_ws <id> [name] [x] [y]}
-  shift
-  mkdir -p "$PROJECT_DIR/.log"
-  (cd "$PROJECT_DIR" && exec python3 WM.py WM_WS_M $((6000 + id)) "localhost:$WM_PORT" "$id" "$@") \
-    >>"$PROJECT_DIR/.log/ws${id}_monitor.log" 2>&1 &
-  local monitor_pid=$!
-  echo "wm_ws: monitor running in background (pid $monitor_pid, log: .log/ws${id}_monitor.log)"
-  wm_engine "$id"
-  kill "$monitor_pid" 2>/dev/null
+  (cd "$PROJECT_DIR" && LOG_DIR="${LOG_DIR:-$PROJECT_DIR/.log}" python3 WM_Central/WM_Central.py "$WM_PORT" "$WM_KAFKA")
 }
 
 wm_fo() {
-  local operator=${1:?usage: wm_fo <operator_id> [requests_file]}
-  shift
-  (cd "$PROJECT_DIR" && python3 WM.py WM_FO "$WM_KAFKA" "$operator" "$@")
+  (cd "$PROJECT_DIR" && python3 WM_FO/WM_FO.py "$WM_KAFKA" "$@")
+}
+
+wm_ws_m() {
+  (cd "$PROJECT_DIR" && python3 WM_WS/WM_WS_M.py "$1" "localhost:$WM_PORT" "$WM_KAFKA" "${@:2}")
+}
+
+wm_ws_e() {
+  (cd "$PROJECT_DIR" && python3 WM_WS/WM_WS_E.py "localhost:$1")
+}
+
+wm_tests() {
+  (cd "$PROJECT_DIR" && python3 run_tests "$@")
 }
 
 notools() {
@@ -185,7 +178,7 @@ notools() {
   unset -f notools
   unset -f manager
   unset -f kafka
-  unset -f wm_central wm_monitor wm_engine wm_ws wm_fo
+  unset -f wm_central wm_fo wm_ws_m wm_ws_e wm_tests
   unset -f h
 }
 

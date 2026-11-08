@@ -17,8 +17,6 @@ from types import SimpleNamespace
 from confluent_kafka import Consumer, Producer
 
 
-KAFKA_TOPIC = "water.management"
-
 USAGE_MSG = """
 Usage:
     WM_Central <login_port> <kafka_host>:<kafka_port>
@@ -34,13 +32,13 @@ DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS stations (
     id INTEGER PRIMARY KEY,
     x INTEGER, y INTEGER,
-    name TEXT,
+    name TEXT UNIQUE,
     state INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS operators (
     id INTEGER PRIMARY KEY,
     x INTEGER, y INTEGER,
-    name TEXT,
+    name TEXT UNIQUE,
     cur_station INTEGER DEFAULT NULL
 );
 """
@@ -102,6 +100,14 @@ WS_I_AM = 0x19  # bytes[0x19, op_id, x, y, STX, name (n bytes), ETX, state]
 OP_I_AM = 0x1A  # bytes[0x1A, op_id, x, y, STX, name (n bytes), ETX, cur_station]
 WS_WATERINFO = 0x1B  # bytes[0x1B, ws_id, liters_per_minute, accum]
 FLUSH_DB = 0x1C  # bytes[0x1C]
+
+
+# Kafka topics
+T_WATERING_REQUESTS = "watering-requests"  # OP -> C
+T_OP_CONTROL = "op-control"  # C -> OP
+T_WS_CONTROL = "ws-control"  # C -> WS
+T_WS_STATE = "ws-state"  # WS -> C
+T_OP_STATE = "op-state"  # OP -> C
 
 
 # TODO: make it print instruction formats automatically
@@ -506,6 +512,7 @@ def run_kafka(
     ui_input: Queue[bytes],
     shutdown_event: threading.Event,
 ) -> None:
+    topics = [T_WATERING_REQUESTS, T_WS_STATE, T_OP_STATE]
     producer = Producer({"bootstrap.servers": kafka, "client.id": "wm-central"})
     consumer = Consumer(
         {
@@ -514,87 +521,25 @@ def run_kafka(
             "auto.offset.reset": "earliest",
         }
     )
-    consumer.subscribe([KAFKA_TOPIC])
+    consumer.subscribe(topics)
+    tell(OK, f"(kafka) escuchando en {topics}@{kafka}")
 
-    # TODO: why should I use a key?
-    def send(topic: str, key: int | None, data: bytes) -> None:
-        producer.produce(topic, data, key=None if key is None else bytes([key]))
-        producer.poll(0)
-
-    def set_state(ws_id: int, state: int) -> None:
-        with ws_lock:
-            station = stations.get(ws_id)
-            if station is None:
-                tell(ERROR, f"(kafka) la estación {ws_id} no existe")
-                return
-            station.state = state
-        ins = bytes([WS_PUBLISH_STATE, ws_id, state])
-        watchdog_queue.put(ins)
-        ui_out.put(ins)
-        send(KAFKA_TOPIC, ws_id, ins)
-        tell(OK, f"(kafka) estación {ws_id} -> {WS_STATE_NAMES[state]}")
-
-    def op_req_watering(ins: SimpleNamespace, raw: bytes) -> None:
-        with ws_lock:
-            station = stations.get(ins.ws_id)
-            available = station is not None and station.state == AVAILABLE
-        if ins.op_id not in operators or not available:
-            tell(
-                WARNING,
-                f"(kafka) riego denegado: operador {ins.op_id} -> estación {ins.ws_id}",
-            )
-            send(
-                KAFKA_TOPIC,
-                ins.op_id,
-                bytes([WS_ANSWER_WATERING, NACK, ins.op_id, ins.ws_id]),
-            )
-            return
-        send(KAFKA_TOPIC, ins.ws_id, raw)
-
-    def ws_answer_watering(ins: SimpleNamespace, raw: bytes) -> None:
-        send(KAFKA_TOPIC, ins.op_id, raw)
-        if ins.ack == ACK:
-            set_state(ins.ws_id, WATERING)
-
-    def publish_state(ins: SimpleNamespace, raw: bytes) -> None:
-        set_state(ins.id, ins.state)
-
-    def ws_i_am(ins: SimpleNamespace, raw: bytes) -> None:
-        with ws_lock:
-            stations[ins.id] = ins
-        watchdog_queue.put(raw)
-        ui_out.put(raw)
-        send(KAFKA_TOPIC, ins.id, bytes([WS_PUBLISH_STATE, ins.id, ins.state]))
-
-    def op_i_am(ins: SimpleNamespace, raw: bytes) -> None:
-        operators[ins.id] = ins
-        watchdog_queue.put(raw)
-        ui_out.put(raw)
-
-    def ws_goodbye(ins: SimpleNamespace, raw: bytes) -> None:
-        set_state(ins.id, DISCONNECTED)
-
-    def op_goodbye(ins: SimpleNamespace, raw: bytes) -> None:
-        tell(OK, f"(kafka) el operador {ins.id} se ha desconectado")
-        ui_out.put(raw)
-
-    def to_ui(ins: SimpleNamespace, raw: bytes) -> None:
-        ui_out.put(raw)
-
-    handlers = {
-        OP_REQ_WATERING: op_req_watering,
-        WS_ANSWER_WATERING: ws_answer_watering,
-        WS_PUBLISH_STATE: publish_state,
-        WS_I_AM: ws_i_am,
-        OP_I_AM: op_i_am,
-        WS_GOODBYE: ws_goodbye,
-        OP_GOODBYE: op_goodbye,
-        OP_WATERING: to_ui,
-    }
-
-    tell(OK, f"(kafka) escuchando en {KAFKA_TOPIC}@{kafka}")
     try:
         while not shutdown_event.is_set():
+            # 1. Commands from the UI: C_* instructions, all of them [opcode, id]
+            while not ui_input.empty():
+                cmd = ui_input.get_nowait()
+                if len(cmd) != 2:
+                    tell(ERROR, f"(kafka) comando de la UI malformado: {cmd!r}")
+                elif cmd[0] == C_OP_SHUTDOWN:
+                    producer.produce(T_OP_CONTROL, cmd, key=bytes([cmd[1]]))
+                elif cmd[0] in (C_REQ_WATERING, C_WS_SHUTDOWN, C_PING_WS, C_WATERING):
+                    producer.produce(T_WS_CONTROL, cmd, key=bytes([cmd[1]]))
+                else:
+                    tell(ERROR, f"(kafka) comando de la UI desconocido: {cmd!r}")
+            producer.poll(0)
+
+            # 2. Messages from stations and operators
             msg = consumer.poll(0.5)
             if msg is None:
                 continue
@@ -602,16 +547,115 @@ def run_kafka(
                 tell(ERROR, f"(kafka) {msg.error()}")
                 continue
             raw = msg.value()
-            if raw and raw[0] == WS_WATERINFO and len(raw) == 4:
-                ui_out.put(raw)  # not handled by decompress_instruction yet
+            if not raw:
                 continue
-            if not raw or raw[0] not in handlers:
-                tell(ERROR, f"(kafka) instrucción no soportada: {raw!r}")
-                continue
-            try:
-                handlers[raw[0]](decompress_instruction(raw), raw)
-            except InsFmtException as err:
-                tell(ERROR, f"(kafka) {err}")
+
+            topic = msg.topic()
+            opcode = raw[0]
+
+            if topic == T_WATERING_REQUESTS:
+                if opcode == OP_REQ_WATERING and len(raw) == 3:
+                    # [OP_REQ_WATERING, op_id, ws_id]
+                    op_id, ws_id = raw[1], raw[2]
+                    with ws_lock:
+                        station = stations.get(ws_id)
+                        available = station is not None and station.state == AVAILABLE
+                    if op_id in operators and available:
+                        tell(OK, f"(kafka) operador {op_id} pide regar en {ws_id}")
+                        producer.produce(T_WS_CONTROL, raw, key=bytes([ws_id]))
+                    else:
+                        tell(
+                            WARNING, f"(kafka) riego denegado: op {op_id} -> ws {ws_id}"
+                        )
+                        producer.produce(
+                            T_OP_CONTROL,
+                            bytes([WS_ANSWER_WATERING, NACK, op_id, ws_id]),
+                            key=bytes([op_id]),
+                        )
+                elif opcode == OP_WATERING and len(raw) == 3:
+                    # [OP_WATERING, op_id, ws_id]
+                    ui_out.put(raw)
+                else:
+                    tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
+
+            elif topic == T_WS_STATE:
+                if opcode == WS_ANSWER_WATERING and len(raw) == 4:
+                    # [WS_ANSWER_WATERING, ACK/NACK, op_id, ws_id]
+                    answer, op_id, ws_id = raw[1], raw[2], raw[3]
+                    producer.produce(T_OP_CONTROL, raw, key=bytes([op_id]))
+                    if answer == ACK:
+                        with ws_lock:
+                            if ws_id in stations:
+                                stations[ws_id].state = WATERING
+                        state_ins = bytes([WS_PUBLISH_STATE, ws_id, WATERING])
+                        watchdog_queue.put(state_ins)
+                        ui_out.put(state_ins)
+                elif (
+                    opcode == WS_PUBLISH_STATE and len(raw) == 3 and raw[2] in WS_STATES
+                ):
+                    # [WS_PUBLISH_STATE, ws_id, state]
+                    ws_id, state = raw[1], raw[2]
+                    with ws_lock:
+                        if ws_id in stations:
+                            stations[ws_id].state = state
+                    tell(OK, f"(kafka) estación {ws_id} -> {WS_STATE_NAMES[state]}")
+                    watchdog_queue.put(raw)
+                    ui_out.put(raw)
+                elif opcode == WS_I_AM and len(raw) >= 7 and raw[4] == STX:
+                    # [WS_I_AM, ws_id, x, y, STX, name..., ETX, state]
+                    name_end = raw.find(ETX, 5)
+                    state = raw[-1]
+                    if name_end == -1 or state not in WS_STATES:
+                        tell(ERROR, f"(kafka) WS_I_AM malformado: {raw!r}")
+                        continue
+                    ws_id = raw[1]
+                    name = raw[5:name_end].decode(errors="replace")
+                    with ws_lock:
+                        stations[ws_id] = SimpleNamespace(
+                            id=ws_id, x=raw[2], y=raw[3], name=name, state=state
+                        )
+                    watchdog_queue.put(raw)
+                    ui_out.put(raw)
+                elif opcode == WS_GOODBYE and len(raw) == 2:
+                    # [WS_GOODBYE, ws_id]
+                    ws_id = raw[1]
+                    with ws_lock:
+                        if ws_id in stations:
+                            stations[ws_id].state = DISCONNECTED
+                    tell(OK, f"(kafka) la estación {ws_id} se ha desconectado")
+                    state_ins = bytes([WS_PUBLISH_STATE, ws_id, DISCONNECTED])
+                    watchdog_queue.put(state_ins)
+                    ui_out.put(state_ins)
+                elif opcode == WS_WATERINFO and len(raw) == 4:
+                    # [WS_WATERINFO, ws_id, liters_per_minute, accum]
+                    ui_out.put(raw)
+                else:
+                    tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
+
+            elif topic == T_OP_STATE:
+                if opcode == OP_I_AM and len(raw) >= 7 and raw[4] == STX:
+                    # [OP_I_AM, op_id, x, y, STX, name..., ETX, cur_station]
+                    name_end = raw.find(ETX, 5)
+                    if name_end == -1:
+                        tell(ERROR, f"(kafka) OP_I_AM malformado: {raw!r}")
+                        continue
+                    op_id = raw[1]
+                    operators[op_id] = SimpleNamespace(
+                        id=op_id,
+                        x=raw[2],
+                        y=raw[3],
+                        name=raw[5:name_end].decode(errors="replace"),
+                        cur_station=raw[-1],
+                    )
+                    watchdog_queue.put(raw)
+                    ui_out.put(raw)
+                elif opcode == OP_GOODBYE and len(raw) == 2:
+                    # [OP_GOODBYE, op_id]
+                    tell(OK, f"(kafka) el operador {raw[1]} se ha desconectado")
+                    ui_out.put(raw)
+                else:
+                    tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
+
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -619,7 +663,7 @@ def run_kafka(
         shutdown_event.set()
         watchdog_queue.put(bytes([EXIT]))
         consumer.close()
-        producer.flush(5)
+        producer.flush(3)
 
 
 # ui_server helpers

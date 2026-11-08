@@ -581,3 +581,21 @@ class TestWatchdog(unittest.TestCase):
         self.thread.join(timeout=3)
         self.assertFalse(self.thread.is_alive())
         self.assertEqual(self.station(8), (8, 1, 1, "Final", AVAILABLE))
+
+
+class TestKafka(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        pass
+
+    def setUp(self) -> None:
+        pass
+
+    def tearDown(self) -> None:
+        pass
+
+    def test_01_tolerate_new_operator(self):
+        pass
+
+    def test_02_tolerate_operator_update(self):
+        pass
