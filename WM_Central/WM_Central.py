@@ -528,17 +528,11 @@ def run_kafka(
         @override
         def __eq__(self, value: object) -> bool:
             if isinstance(value, Expectation):
-                return (
-                    self.opcode == value.opcode
-                    and self.author == value.author
-                )
+                return self.opcode == value.opcode and self.author == value.author
             if isinstance(value, bytes):
                 if len(value) != 2:
                     return False
-                return (
-                    self.opcode == value[0]
-                    and self.author == value[1]
-                )
+                return self.opcode == value[0] and self.author == value[1]
             return False
 
         @override
@@ -551,7 +545,7 @@ def run_kafka(
             topic: str,
             opcode: int,
             params: bytes,
-            maker: Callable[[Action, bytes], tuple[str, bytes, bytes]]
+            maker: Callable[[Action, bytes], tuple[str, bytes, bytes]],
             # TODO: timeout_callback -> __del__ callback for when it was not valid to send something with a producer
         ):
             self.topic: str = topic
@@ -565,14 +559,15 @@ def run_kafka(
 
     class ActionChain:
         MAX_LIFETIME: float = 5.0
+
         def __init__(self, producer: Producer, *actions: Action):
             self.timestamp: float = time.monotonic()
             self.actions: tuple[Action, ...] = actions
 
         def are_valid(self) -> bool:
-            return time.monotonic() - self.timestamp < Actions.MAX_LIFETIME
+            return time.monotonic() - self.timestamp < ActionChain.MAX_LIFETIME
 
-        def produce(self, raw_invoker: bytes) -> None:
+        def execute(self, raw_invoker: bytes) -> None:
             for a in self.actions:
                 producer.produce(*a.build(raw_invoker))
             _ = producer.poll(0)
@@ -655,15 +650,14 @@ def run_kafka(
             tell(WARNING, fmt_op_log(op_id, ws_id, "estación no disponible"))
         else:
             producer.produce(T_WS_CONTROL, bytes([WATERING_ASSIGN, ws_id, op_id]), key)
-            pending[bytes([PUBLISH_STATE, ws_id])] = SimpleNamespace(
-                timestamp=time.monotonic(),
-                actions=[
-                    SimpleNamespace(topic, opcode, params, callback)
-                ]
-                topic=T_OP_CONTROL,
-                opcode=ANS_WATERING,
-                params=bytes([op_id, ws_id]),
-                callback=infer_reason
+            pending[Expectation(PUBLISH_STATE, ws_id)] = ActionChain(
+                producer,
+                Action(
+                    T_OP_CONTROL,
+                    ANS_WATERING,
+                    bytes([op_id, ws_id]),
+                    handle_ans_watering,
+                ),
             )
             tell(OK, fmt_op_log(op_id, ws_id, "resolviendo solicitud de riego..."))
 
