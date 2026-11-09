@@ -110,40 +110,47 @@ T_WS_STATE = "ws-state"  # WS -> C
 T_OP_STATE = "op-state"  # OP -> C
 
 
-# TODO: make it print instruction formats automatically
-class InsFmtException(Exception):
-    def __init__(self, i: bytes, msg: str | Exception = "") -> None:
+class InsFmtError(Exception):
+    # TODO: add instruction format printing
+    def __init__(
+        self, i: bytes, msg: str | Exception = "", expected_bytes: int | None = None
+    ) -> None:
         self.instruction = i
         self.msg = str(msg)
-        super().__init__(f"(opcode: {i[0]}) {msg} (tiene {len(i)} bytes)")
+        self.expected_bytes = expected_bytes
+        xb_msg: str = "tiene un formato de instrucción erróneo"
+        extra_info: str = ""
+        if expected_bytes:
+            xb_msg = f"esperaba {expected_bytes} bytes y tiene {len(i)} bytes"
+        if self.msg:
+            extra_info = ", " + self.msg
+        super().__init__(f"(opcode: {i[0]}) {xb_msg} {extra_info}")
 
 
 def decompress_instruction(i: bytes) -> SimpleNamespace:
     if not len(i):
-        raise InsFmtException(i, "instrucción vacía")
+        raise InsFmtError(i, "instrucción vacía")
 
     def entity_fmt(i: bytes) -> SimpleNamespace:
         name_end: int
         state: int
         if len(i) < 7:
-            raise InsFmtException(
+            raise InsFmtError(
                 i, "debe tener 7+ bytes (id, x, y, STX, name (n bytes), ETX, infobyte)"
             )
         if i[4] != STX:
-            raise InsFmtException(i, "falta STX en el quinto byte")
+            raise InsFmtError(i, "falta STX en el quinto byte")
         if (name_end := i.find(ETX, 5)) == -1:
-            raise InsFmtException(i, "falta ETX como delimitador del campo 'name'")
+            raise InsFmtError(i, "falta ETX como delimitador del campo 'name'")
         try:
             res = SimpleNamespace(id=i[1], x=i[2], y=i[3], name=i[5:name_end].decode())
         except UnicodeError as err:
-            raise InsFmtException(i, err)
+            raise InsFmtError(i, err)
 
         if i[0] == OP_I_AM:
             res.cur_station = i[len(i) - 1]
         elif (state := i[len(i) - 1]) not in WS_STATES:
-            raise InsFmtException(
-                i, f"el estado de la estación con id={i[1]} no existe"
-            )
+            raise InsFmtError(i, f"el estado de la estación con id={i[1]} no existe")
         else:
             res.state = state
 
@@ -151,22 +158,22 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
 
     def id_fmt(i: bytes) -> SimpleNamespace:
         if len(i) != 2:
-            raise InsFmtException(i, "Debe tener 2 bytes (opcode, id)")
+            raise InsFmtError(i, "Debe tener 2 bytes (opcode, id)")
         return SimpleNamespace(id=i[1])
 
     def op_ws_fmt(i: bytes) -> SimpleNamespace:
         if len(i) != 3:
-            raise InsFmtException(i, "debe tener 3 bytes (opcode, op_id, ws_id)")
+            raise InsFmtError(i, "debe tener 3 bytes (opcode, op_id, ws_id)")
         return SimpleNamespace(op_id=i[1], ws_id=i[2])
 
     def ack_nack_fmt(i: bytes) -> SimpleNamespace:
         res: SimpleNamespace
         if i[0] == WS_C_ANSWER_WATERING:
             if len(i) != 2:
-                raise InsFmtException(i, "debe tener 2 bytes (opcode, ACK/NACK)")
+                raise InsFmtError(i, "debe tener 2 bytes (opcode, ACK/NACK)")
             res = SimpleNamespace(ack=i[2])
         elif len(i) != 4:
-            raise InsFmtException(
+            raise InsFmtError(
                 i, "debe tener 4 bytes (opcode, ACK/NACK, op_id, station_id)"
             )
         res = SimpleNamespace(ack=i[1], op_id=i[2], ws_id=i[3])
@@ -174,9 +181,9 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
 
     def state_publish_fmt(i: bytes) -> SimpleNamespace:
         if len(i) != 3:
-            raise InsFmtException(i, "debe tener 3 bytes (opcode, id, estado)")
+            raise InsFmtError(i, "debe tener 3 bytes (opcode, id, estado)")
         if i[2] >= len(WS_STATE_NAMES):
-            raise InsFmtException(
+            raise InsFmtError(
                 i, f"id={i[1]} tiene un estado inexistente con código {i[2]}"
             )
         return SimpleNamespace(id=i[1], state=i[2])
@@ -206,7 +213,7 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
     if i[0] not in inst_v:
         if len(i) == 1:
             return SimpleNamespace(opcode=i[0])
-        raise InsFmtException(i, "instrucción inexistente")
+        raise InsFmtError(i, "instrucción inexistente")
     return inst_v[i[0]](i)
 
 
@@ -228,11 +235,11 @@ def compress_namespace(opcode: int, ns: SimpleNamespace) -> bytes:
         SERVER_ACK_WS_REGISTER: id_fmt,
     }
     if opcode not in inst_c:
-        raise InsFmtException(bytes([opcode]), "Instrucción no existente")
+        raise InsFmtError(bytes([opcode]), "Instrucción no existente")
     try:
         return inst_c[opcode]()
     except (AttributeError, ValueError) as e:
-        raise InsFmtException(bytes([opcode]), str(e)) from e
+        raise InsFmtError(bytes([opcode]), str(e)) from e
 
 
 def stamp() -> str:
@@ -391,7 +398,7 @@ def login_server(
                 try:
                     ins = decompress_instruction(data)
                     response = instructions[data[0]](ins, stations, ws_lock)
-                except (InsFmtException, UnicodeDecodeError) as err:
+                except (InsFmtError, UnicodeDecodeError) as err:
                     tell(
                         ERROR,
                         f"(login server) {addr} {err}",
@@ -423,7 +430,7 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
             ns: SimpleNamespace
             try:
                 ns = decompress_instruction(ins)
-            except InsFmtException as err:
+            except InsFmtError as err:
                 tell(ERROR, str(err))
                 continue
 
@@ -524,9 +531,54 @@ def run_kafka(
     consumer.subscribe(topics)
     tell(OK, f"(kafka) escuchando en {topics}@{kafka}")
 
+    class OperatorError(Exception):
+        def __init__(
+            self,
+            op_id: int,
+            reason: str = "",
+            ws_id: int | None = None,
+            errlvl: str = WARNING,
+        ) -> None:
+            self.op_id = op_id
+            self.ws_id = ws_id
+            self.errlvl = errlvl
+            reason_fmt: str = ""
+            objective: str = ""
+            op_name: str = ") no existe"
+            if op_id in operators:
+                op_name = f", {operators[op_id].name})"
+                if ws_id is not None:
+                    objective = f" -> (estación {ws_id}, {stations[ws_id].name})"
+            if reason:
+                reason_fmt = f" :: {reason}"
+            self.msg = f"(operador {op_id}{op_name}{objective}{reason_fmt}"
+            super().__init__(self.msg)
+
+    def op_watering_request(raw: bytes):
+        op_id, ws_id = raw[1], raw[2]
+        with ws_lock:
+            station = stations.get(ws_id)
+        if station is None:
+            raise OperatorError(op_id, "estación inexistente", ws_id)
+        elif op_id not in operators:
+            raise OperatorError(op_id, errlvl=ERROR)
+        elif operators[op_id].cur_station is not None:
+            raise OperatorError(op_id, "está ocupado, no puede regar aún")
+        elif operators[op_id].cur_station == None and station.state == AVAILABLE:
+            # TODO: continue here and then test
+            tell(OK, f"(kafka) operador {op_id} pide regar en {ws_id}")
+            producer.produce(T_WS_CONTROL, raw, key=bytes([ws_id]))
+        else:
+            tell(WARNING, f"(kafka) riego denegado: op {op_id} -> ws {ws_id}")
+            producer.produce(
+                T_OP_CONTROL,
+                bytes([WS_ANSWER_WATERING, NACK, op_id, ws_id]),
+                key=bytes([op_id]),
+            )
+        ui_out.put(raw)
+
     try:
         while not shutdown_event.is_set():
-            # 1. Commands from the UI: C_* instructions, all of them [opcode, id]
             while not ui_input.empty():
                 cmd = ui_input.get_nowait()
                 if len(cmd) != 2:
@@ -539,8 +591,7 @@ def run_kafka(
                     tell(ERROR, f"(kafka) comando de la UI desconocido: {cmd!r}")
             producer.poll(0)
 
-            # 2. Messages from stations and operators
-            msg = consumer.poll(0.5)
+            msg = consumer.poll(0.2)
             if msg is None:
                 continue
             if msg.error():
@@ -548,6 +599,7 @@ def run_kafka(
                 continue
             raw = msg.value()
             if not raw:
+                tell(WARNING, "(kafka) detectada una instrucción vacía")
                 continue
 
             topic = msg.topic()
@@ -555,22 +607,7 @@ def run_kafka(
 
             if topic == T_WATERING_REQUESTS:
                 if opcode == OP_REQ_WATERING and len(raw) == 3:
-                    op_id, ws_id = raw[1], raw[2]
-                    with ws_lock:
-                        station = stations.get(ws_id)
-                        available = station is not None and station.state == AVAILABLE
-                    if op_id in operators and available:
-                        tell(OK, f"(kafka) operador {op_id} pide regar en {ws_id}")
-                        producer.produce(T_WS_CONTROL, raw, key=bytes([ws_id]))
-                    else:
-                        tell(
-                            WARNING, f"(kafka) riego denegado: op {op_id} -> ws {ws_id}"
-                        )
-                        producer.produce(
-                            T_OP_CONTROL,
-                            bytes([WS_ANSWER_WATERING, NACK, op_id, ws_id]),
-                            key=bytes([op_id]),
-                        )
+                    op_watering_request(raw)
                 elif opcode == OP_WATERING and len(raw) == 3:
                     ui_out.put(raw)
                 else:
