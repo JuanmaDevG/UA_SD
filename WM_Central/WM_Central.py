@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+from typing import Callable, override
+from __future__ import annotations
 
 from confluent_kafka import Consumer, Producer
 
@@ -64,6 +66,14 @@ WS_STATES = (DISCONNECTED, AVAILABLE, WATERING, LEAK, OUT_OF_SERVICE)
 WS_STATE_NAMES = ["DISCONNECTED", "AVAILABLE", "WATERING", "LEAK", "OUT_OF_SERVICE"]
 
 
+# Kafka topics
+T_WATERING_REQUESTS = "watering-requests"  # OP -> C
+T_OP_CONTROL = "op-control"  # C -> OP
+T_WS_CONTROL = "ws-control"  # C -> WS
+T_WS_CHANNEL = "stations-channel"  # WS -> C
+T_OP_CHANNEL = "operators-channel"  # OP -> C
+
+
 # General instructions
 EXIT = 0x00
 STX = 0x01
@@ -71,43 +81,48 @@ ETX = 0x02
 NACK = 0x03
 ACK = 0x04
 
+# Login server
+WS_REGISTER = 0x05  # [id, x, y, STX, name (n bytes), ETX, state]
+WS_LOGIN = 0x06  # [id]
+SERVER_ACK_WS_LOGIN = 0x07  # [id, x, y, STX, name (n bytes), ETX, state]
+SERVER_ACK_WS_REGISTER = 0x08  # [id]
 
-# Login server instructions
-WS_REGISTER = 0x05  # bytes[0x05, id, x, y, STX, name (n bytes), ETX, state]
-WS_LOGIN = 0x06  # bytes[0x06, id]
-SERVER_ACK_WS_LOGIN = 0x07  # bytes[0x07, id, x, y, STX, name (n bytes), ETX, state]
-SERVER_ACK_WS_REGISTER = 0x08  # bytes[0x08, id]
+# central -> operator instructions
+OP_PING = 0x09  # [op_id]
+OP_LS = 0x0A
+OP_LOGOUT_PLEASE = 0x0B  # [op_id]
+ANS_WATERING = 0x0C  # [op_id, ws_id, REASON]
+PING_OP = 0x0D  # [op_id]
+
+# operator -> central instructions
+REQ_WATERING = 0x0E  # [op_id, ws_id]
+CUR_STATION = 0x0F  # [op_id]
+OP_I_AM = 0x10  # [op_id, x, y, STX, name (n bytes), ETX, cur_station]
+OP_GOODBYE = 0x11  # [op_id]
+
+# central -> station instructions
+WS_PING = 0x12  # [ws_id]
+WS_LS = 0x13
+WS_LOGOUT_PLEASE = 0x14  # [ws_id]
+WATERING_ASSIGN = 0x15  # [ws_id, op_id]
+ASK_BUSY = 0x16  # [ws_id]
+
+# station -> central instructions
+PUBLISH_STATE = 0x17  # [ws_id, state]
+WS_I_AM = 0x18  # [ws_id, x, y, STX, name (n bytes), ETX, state]
+WS_GOODBYE = 0x19  # [ws_id]
+WS_WATERINFO = 0x1A  # [ws_id, lpm, accum]
+
+# miscelaneous
+FLUSH_DB = 0x1B  # bytes[0x1C]
 
 
-# Kafka instructions
-OP_REQ_WATERING = 0x09  # bytes[0x09, op_id, ws_id]
-WS_ANSWER_WATERING = 0x0A  # bytes[0x0A, ACK/NACK, op_id, ws_id]
-C_REQ_WATERING = 0x0B  # bytes[0x0B, ws_id]
-WS_C_ANSWER_WATERING = 0x0C  # bytes[0x0C, ACK/NACK]
-C_WS_SHUTDOWN = 0x0D  # bytes[0x0D, ws_id]
-C_OP_SHUTDOWN = 0x0E  # bytes[0x0D, ws_id]
-WS_GOODBYE = 0x0F  # bytes[0x0F, ws_id]
-OP_GOODBYE = 0x10  # bytes[0x10, op_id]
-C_PING_WS = 0x11  # bytes[0x11, ws_id]
-WS_PUBLISH_STATE = 0x12  # bytes[0x12, ws_id, state]
-OP_WATERING = 0x13  # bytes[0x13, op_id, ws_id]
-C_WATERING = 0x14  # bytes[0x14, ws_id]
-LS_STATIONS = 0x15  # bytes[0x15]
-LS_OPERATORS = 0x16  # bytes[0x16]
-C_GET_STATION = 0x17  # bytes[0x18, ws_id]
-C_GET_OPERATOR = 0x18  # bytes[0x18, op_id]
-WS_I_AM = 0x19  # bytes[0x19, op_id, x, y, STX, name (n bytes), ETX, state]
-OP_I_AM = 0x1A  # bytes[0x1A, op_id, x, y, STX, name (n bytes), ETX, cur_station]
-WS_WATERINFO = 0x1B  # bytes[0x1B, ws_id, liters_per_minute, accum]
-FLUSH_DB = 0x1C  # bytes[0x1C]
-
-
-# Kafka topics
-T_WATERING_REQUESTS = "watering-requests"  # OP -> C
-T_OP_CONTROL = "op-control"  # C -> OP
-T_WS_CONTROL = "ws-control"  # C -> WS
-T_WS_STATE = "ws-state"  # WS -> C
-T_OP_STATE = "op-state"  # OP -> C
+# REASON for ANS_WATERING
+WATERING_OK = 0x00
+NON_EXISTENT_STATION = 0x01
+NON_EXISTENT_OPERATOR = 0x02
+OPERATOR_IS_BUSY = 0x03
+STATION_UNAVAILABLE = 0x04
 
 
 class InsFmtError(Exception):
@@ -115,9 +130,9 @@ class InsFmtError(Exception):
     def __init__(
         self, i: bytes, msg: str | Exception = "", expected_bytes: int | None = None
     ) -> None:
-        self.instruction = i
-        self.msg = str(msg)
-        self.expected_bytes = expected_bytes
+        self.instruction: bytes = i
+        self.msg: str = str(msg)
+        self.expected_bytes: int | None = expected_bytes
         xb_msg: str = "tiene un formato de instrucción erróneo"
         extra_info: str = ""
         if expected_bytes:
@@ -168,11 +183,7 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
 
     def ack_nack_fmt(i: bytes) -> SimpleNamespace:
         res: SimpleNamespace
-        if i[0] == WS_C_ANSWER_WATERING:
-            if len(i) != 2:
-                raise InsFmtError(i, "debe tener 2 bytes (opcode, ACK/NACK)")
-            res = SimpleNamespace(ack=i[2])
-        elif len(i) != 4:
+        if len(i) != 4:
             raise InsFmtError(
                 i, "debe tener 4 bytes (opcode, ACK/NACK, op_id, station_id)"
             )
@@ -193,20 +204,10 @@ def decompress_instruction(i: bytes) -> SimpleNamespace:
         SERVER_ACK_WS_LOGIN: entity_fmt,
         WS_LOGIN: id_fmt,
         SERVER_ACK_WS_REGISTER: id_fmt,
-        OP_REQ_WATERING: op_ws_fmt,
-        WS_ANSWER_WATERING: ack_nack_fmt,
-        C_REQ_WATERING: id_fmt,
-        WS_C_ANSWER_WATERING: ack_nack_fmt,
-        C_WS_SHUTDOWN: id_fmt,
-        C_OP_SHUTDOWN: id_fmt,
+        REQ_WATERING: op_ws_fmt,
+        ANS_WATERING: ack_nack_fmt,
         WS_GOODBYE: id_fmt,
         OP_GOODBYE: id_fmt,
-        C_PING_WS: id_fmt,
-        WS_PUBLISH_STATE: state_publish_fmt,
-        OP_WATERING: op_ws_fmt,
-        C_WATERING: id_fmt,
-        C_GET_STATION: id_fmt,
-        C_GET_OPERATOR: id_fmt,
         WS_I_AM: entity_fmt,
         OP_I_AM: entity_fmt,
     }
@@ -291,7 +292,7 @@ def getdb() -> sqlite3.Connection:
     db_loc.mkdir(0o700, parents=True, exist_ok=True)
     db_loc /= "wm.db"
     db = sqlite3.Connection(db_loc)
-    db.executescript(
+    _ = db.executescript(
         DB_SCHEMA
         + "INSERT OR IGNORE INTO operators (id, x, y, name) VALUES "
         + ",".join(
@@ -350,7 +351,7 @@ def ws_register(
             tell(
                 WARNING,
                 f"(login server) el id={ins.id} ya estaba registrado, "
-                "actualizando datos...",
+                + "actualizando datos...",
             )
         stations[ins.id] = ins
 
@@ -416,10 +417,10 @@ def login_server(
 
 def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
     db = getdb()
-    db.execute("PRAGMA journal_mode=EXCLUSIVE")
-    db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA busy_timeout=5000")
-    db.execute("BEGIN")
+    _ = db.execute("PRAGMA journal_mode=EXCLUSIVE")
+    _ = db.execute("PRAGMA synchronous=NORMAL")
+    _ = db.execute("PRAGMA busy_timeout=5000")
+    _ = db.execute("BEGIN")
     try:
         start = time.monotonic()
         while not shutdown_event.is_set():
@@ -439,7 +440,7 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
                     "SELECT id FROM stations WHERE id = ?", (ns.id,)
                 ).fetchone()
                 if r is None:
-                    db.execute(
+                    _ = db.execute(
                         "INSERT INTO stations VALUES (?,?,?,?,?)",
                         (ns.id, ns.x, ns.y, ns.name, ns.state),
                     )
@@ -448,9 +449,9 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
                         f"(watchdog) added watering station {ns.id}: {ns.name}({ns.x},{ns.y}) {WS_STATE_NAMES[ns.state]}",
                     )
                 else:
-                    db.execute(
+                    _ = db.execute(
                         "UPDATE stations SET x = ?, y = ?, name = ?,"
-                        "state = ? WHERE id = ?",
+                        + "state = ? WHERE id = ?",
                         (ns.x, ns.y, ns.name, ns.state, ns.id),
                     )
                     tell(
@@ -466,7 +467,7 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
                         WARNING,
                         f"(watchdog) an unkown station ({ns.id})was trying to log into the database, ignoring...",
                     )
-            elif ins[0] == WS_PUBLISH_STATE:
+            elif ins[0] == PUBLISH_STATE:
                 tell(
                     OK,
                     f"(watchdog) updating station {ns.id} to {WS_STATE_NAMES[ns.state]}...",
@@ -486,7 +487,7 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
                     (ns.x, ns.y, ns.name, ns.cur_station, ns.id),
                 )
                 if cur.rowcount == 0:
-                    db.execute(
+                    _ = db.execute(
                         "INSERT INTO operators VALUES (?,?,?,?,?)",
                         (ns.id, ns.x, ns.y, ns.name, ns.cur_station),
                     )
@@ -499,7 +500,7 @@ def watchdog(q: Queue[bytes], shutdown_event: threading.Event) -> None:
                 tell(OK, "(watchdog) updating database...")
                 db.commit()
                 tell(OK, "(watchdog) database updated")
-                db.execute("BEGIN")
+                _ = db.execute("BEGIN")
                 start = time.monotonic()
 
     except (KeyboardInterrupt, SystemExit):
@@ -519,7 +520,64 @@ def run_kafka(
     ui_input: Queue[bytes],
     shutdown_event: threading.Event,
 ) -> None:
-    topics = [T_WATERING_REQUESTS, T_WS_STATE, T_OP_STATE]
+    class Expectation:
+        def __init__(self, opcode: int, author: int):
+            self.opcode: int = opcode
+            self.author: int = author
+
+        @override
+        def __eq__(self, value: object) -> bool:
+            if isinstance(value, Expectation):
+                return (
+                    self.opcode == value.opcode
+                    and self.author == value.author
+                )
+            if isinstance(value, bytes):
+                if len(value) != 2:
+                    return False
+                return (
+                    self.opcode == value[0]
+                    and self.author == value[1]
+                )
+            return False
+
+        @override
+        def __hash__(self) -> int:
+            return hash((self.opcode, self.author))
+
+    class Action:
+        def __init__(
+            self,
+            topic: str,
+            opcode: int,
+            params: bytes,
+            maker: Callable[[Action, bytes], tuple[str, bytes, bytes]]
+            # TODO: timeout_callback -> __del__ callback for when it was not valid to send something with a producer
+        ):
+            self.topic: str = topic
+            self.opcode: int = opcode
+            self.params: bytes = params
+            # build(Action, raw_inst) -> tuple[topic, msg, key]
+            self.maker: Callable[[Action, bytes], tuple[str, bytes, bytes]] = maker
+
+        def build(self, raw_invoker: bytes):
+            return self.maker(self, raw_invoker)
+
+    class ActionChain:
+        MAX_LIFETIME: float = 5.0
+        def __init__(self, producer: Producer, *actions: Action):
+            self.timestamp: float = time.monotonic()
+            self.actions: tuple[Action, ...] = actions
+
+        def are_valid(self) -> bool:
+            return time.monotonic() - self.timestamp < Actions.MAX_LIFETIME
+
+        def produce(self, raw_invoker: bytes) -> None:
+            for a in self.actions:
+                producer.produce(*a.build(raw_invoker))
+            _ = producer.poll(0)
+
+    topics = [T_WATERING_REQUESTS, T_WS_CHANNEL, T_OP_CHANNEL]
     producer = Producer({"bootstrap.servers": kafka, "client.id": "wm-central"})
     consumer = Consumer(
         {
@@ -528,73 +586,100 @@ def run_kafka(
             "auto.offset.reset": "earliest",
         }
     )
-    consumer.subscribe(topics)
-    tell(OK, f"(kafka) escuchando en {topics}@{kafka}")
+    pending: dict[Expectation, ActionChain] = {}
 
-    class OperatorError(Exception):
-        def __init__(
-            self,
-            op_id: int,
-            reason: str = "",
-            ws_id: int | None = None,
-            errlvl: str = WARNING,
-        ) -> None:
-            self.op_id = op_id
-            self.ws_id = ws_id
-            self.errlvl = errlvl
-            reason_fmt: str = ""
-            objective: str = ""
-            op_name: str = ") no existe"
-            if op_id in operators:
-                op_name = f", {operators[op_id].name})"
-                if ws_id is not None:
-                    objective = f" -> (estación {ws_id}, {stations[ws_id].name})"
-            if reason:
-                reason_fmt = f" :: {reason}"
-            self.msg = f"(operador {op_id}{op_name}{objective}{reason_fmt}"
-            super().__init__(self.msg)
+    def handle_ui():
+        while not ui_input.empty():
+            cmd = ui_input.get_nowait()
+            if len(cmd) != 2:
+                tell(ERROR, f"(kafka) comando de la UI malformado: {cmd!r}")
+            # TODO: handle ui commands
+            else:
+                tell(ERROR, f"(kafka) comando de la UI desconocido: {cmd!r}")
+        _ = producer.poll(0)
 
-    def op_watering_request(raw: bytes):
+    def fmt_op_log(op_id: int, ws_id: int | None, msg: str) -> str:
+        ans: list[str] = ["(kafka) "]
+        if op_id in operators:
+            ans.append(f"(operador {op_id}, '{operators[op_id].name})")
+        else:
+            ans.append(f"(operador {op_id})")
+        if ws_id is not None:
+            ans.append(f" -> (estación {ws_id}")
+            with ws_lock:
+                if ws_id in stations:
+                    ans.append(f", '{stations[ws_id].name}')")
+                else:
+                    ans.append(")")
+        ans.append(f" :: {msg}")
+
+        return "".join(ans)
+
+    def handle_request_watering(raw: bytes):
+        if len(raw) != 3:
+            raise InsFmtError(raw, expected_bytes=3)
         op_id, ws_id = raw[1], raw[2]
+        station: SimpleNamespace | None
+        key = bytes([op_id])
         with ws_lock:
             station = stations.get(ws_id)
         if station is None:
-            raise OperatorError(op_id, "estación inexistente", ws_id)
-        elif op_id not in operators:
-            raise OperatorError(op_id, errlvl=ERROR)
-        elif operators[op_id].cur_station is not None:
-            raise OperatorError(op_id, "está ocupado, no puede regar aún")
-        elif operators[op_id].cur_station == None and station.state == AVAILABLE:
-            # TODO: continue here and then test
-            tell(OK, f"(kafka) operador {op_id} pide regar en {ws_id}")
-            producer.produce(T_WS_CONTROL, raw, key=bytes([ws_id]))
-        else:
-            tell(WARNING, f"(kafka) riego denegado: op {op_id} -> ws {ws_id}")
+            response = bytes([ANS_WATERING, op_id, ws_id, NON_EXISTENT_STATION])
             producer.produce(
                 T_OP_CONTROL,
-                bytes([WS_ANSWER_WATERING, NACK, op_id, ws_id]),
-                key=bytes([op_id]),
+                response,
+                key,
             )
-        ui_out.put(raw)
+            ui_out.put(response)
+            tell(WARNING, fmt_op_log(op_id, ws_id, "estación inexistente"))
+        elif op_id not in operators:
+            response = bytes([ANS_WATERING, op_id, ws_id, NON_EXISTENT_OPERATOR])
+            # Ask the ui to resolve this
+            ui_out.put(response)
+            tell(
+                ERROR,
+                fmt_op_log(
+                    op_id,
+                    ws_id,
+                    "el operador no existe, ui resuelve...",
+                ),
+            )
+        elif operators[op_id].cur_station is not None:
+            response = bytes([ANS_WATERING, op_id, ws_id, OPERATOR_IS_BUSY])
+            producer.produce(T_OP_CONTROL, response, key)
+            ui_out.put(response)
+            tell(WARNING, fmt_op_log(op_id, ws_id, "operador odupado"))
+        elif station.state != AVAILABLE:
+            response = bytes([ANS_WATERING, op_id, ws_id, STATION_UNAVAILABLE])
+            producer.produce(T_OP_CONTROL, response, key)
+            tell(WARNING, fmt_op_log(op_id, ws_id, "estación no disponible"))
+        else:
+            producer.produce(T_WS_CONTROL, bytes([WATERING_ASSIGN, ws_id, op_id]), key)
+            pending[bytes([PUBLISH_STATE, ws_id])] = SimpleNamespace(
+                timestamp=time.monotonic(),
+                actions=[
+                    SimpleNamespace(topic, opcode, params, callback)
+                ]
+                topic=T_OP_CONTROL,
+                opcode=ANS_WATERING,
+                params=bytes([op_id, ws_id]),
+                callback=infer_reason
+            )
+            tell(OK, fmt_op_log(op_id, ws_id, "resolviendo solicitud de riego..."))
 
+    def handle_publish_state(raw: bytes):
+        pass
+
+    consumer.subscribe(topics)
+    tell(OK, f"(kafka) escuchando en {topics}@{kafka}")
     try:
         while not shutdown_event.is_set():
-            while not ui_input.empty():
-                cmd = ui_input.get_nowait()
-                if len(cmd) != 2:
-                    tell(ERROR, f"(kafka) comando de la UI malformado: {cmd!r}")
-                elif cmd[0] == C_OP_SHUTDOWN:
-                    producer.produce(T_OP_CONTROL, cmd, key=bytes([cmd[1]]))
-                elif cmd[0] in (C_REQ_WATERING, C_WS_SHUTDOWN, C_PING_WS, C_WATERING):
-                    producer.produce(T_WS_CONTROL, cmd, key=bytes([cmd[1]]))
-                else:
-                    tell(ERROR, f"(kafka) comando de la UI desconocido: {cmd!r}")
-            producer.poll(0)
+            handle_ui()
 
             msg = consumer.poll(0.2)
             if msg is None:
                 continue
-            if msg.error():
+            elif msg.error():
                 tell(ERROR, f"(kafka) {msg.error()}")
                 continue
             raw = msg.value()
@@ -604,31 +689,15 @@ def run_kafka(
 
             topic = msg.topic()
             opcode = raw[0]
-
+            if len(raw) > 1 and raw[0:2] in pending:
+                handle_pending(raw)
             if topic == T_WATERING_REQUESTS:
-                if opcode == OP_REQ_WATERING and len(raw) == 3:
-                    op_watering_request(raw)
-                elif opcode == OP_WATERING and len(raw) == 3:
-                    ui_out.put(raw)
-                else:
-                    tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
-
-            elif topic == T_WS_STATE:
-                if opcode == WS_ANSWER_WATERING and len(raw) == 4:
-                    # [WS_ANSWER_WATERING, ACK/NACK, op_id, ws_id]
-                    answer, op_id, ws_id = raw[1], raw[2], raw[3]
-                    producer.produce(T_OP_CONTROL, raw, key=bytes([op_id]))
-                    if answer == ACK:
-                        with ws_lock:
-                            if ws_id in stations:
-                                stations[ws_id].state = WATERING
-                        state_ins = bytes([WS_PUBLISH_STATE, ws_id, WATERING])
-                        watchdog_queue.put(state_ins)
-                        ui_out.put(state_ins)
-                elif (
-                    opcode == WS_PUBLISH_STATE and len(raw) == 3 and raw[2] in WS_STATES
-                ):
-                    # [WS_PUBLISH_STATE, ws_id, state]
+                if opcode == REQ_WATERING:
+                    handle_request_watering(raw)
+            elif topic == T_WS_CHANNEL:
+                if opcode == PUBLISH_STATE and len(raw) == 3 and raw[2] in WS_STATES:
+                    handle_publish_state(raw)
+                    # [PUBLISH_STATE, ws_id, state]
                     ws_id, state = raw[1], raw[2]
                     with ws_lock:
                         if ws_id in stations:
@@ -658,7 +727,7 @@ def run_kafka(
                         if ws_id in stations:
                             stations[ws_id].state = DISCONNECTED
                     tell(OK, f"(kafka) la estación {ws_id} se ha desconectado")
-                    state_ins = bytes([WS_PUBLISH_STATE, ws_id, DISCONNECTED])
+                    state_ins = bytes([PUBLISH_STATE, ws_id, DISCONNECTED])
                     watchdog_queue.put(state_ins)
                     ui_out.put(state_ins)
                 elif opcode == WS_WATERINFO and len(raw) == 4:
@@ -667,7 +736,7 @@ def run_kafka(
                 else:
                     tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
 
-            elif topic == T_OP_STATE:
+            elif topic == T_OP_CHANNEL:
                 if opcode == OP_I_AM and len(raw) >= 7 and raw[4] == STX:
                     # [OP_I_AM, op_id, x, y, STX, name..., ETX, cur_station]
                     name_end = raw.find(ETX, 5)
@@ -690,6 +759,8 @@ def run_kafka(
                     ui_out.put(raw)
                 else:
                     tell(ERROR, f"(kafka) {topic}: instrucción inválida {raw!r}")
+            _ = producer.poll(0)
+            ui_out.put(raw)
 
     except (KeyboardInterrupt, SystemExit):
         pass
@@ -698,14 +769,14 @@ def run_kafka(
         shutdown_event.set()
         watchdog_queue.put(bytes([EXIT]))
         consumer.close()
-        producer.flush(3)
+        _ = producer.flush(3)
 
 
 def ui_server(ui_out: Queue[bytes]):
     pass
 
 
-def main(*args):
+def main(*args: str):
     login_port, kafka = get_netparams(args)
     tell(
         OK, f"Argumentos de conexion correctos: login_port={login_port}, kafka={kafka}"
@@ -724,7 +795,7 @@ def main(*args):
 
     shutdown_event = threading.Event()
     ws_lock = threading.Lock()
-    watchdog_queue = Queue()
+    watchdog_queue: Queue[bytes] = Queue()
     threading.Thread(
         target=login_server,
         name="wm-login",
@@ -739,7 +810,8 @@ def main(*args):
         daemon=True,
     ).start()
 
-    ui_in, ui_out = Queue(), Queue()
+    ui_input: Queue[bytes] = Queue()
+    ui_out: Queue[bytes] = Queue()
     run_kafka(
         kafka,
         stations,
@@ -747,7 +819,7 @@ def main(*args):
         ws_lock,
         watchdog_queue,
         ui_out,
-        ui_in,
+        ui_input,
         shutdown_event,
     )
 

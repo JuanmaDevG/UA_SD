@@ -8,6 +8,9 @@ from queue import Queue
 import socket
 import psutil
 import time
+from pathlib import Path
+
+from typing import override
 
 from tests import LOG_DIR, DOCKER_VOLUME, ENV_LOG_DIR
 from WM_Central import FLUSH_DB, STX, ETX, NACK, WATERING
@@ -68,6 +71,11 @@ class TestParams(unittest.TestCase):
 
 
 class TestDBIntegrity(unittest.TestCase):
+    @override
+    def __init__(self, methodName: str = "runTest") -> None:
+        self.db: sqlite3.Connection
+        super().__init__(methodName)
+
     def test_01_no_env(self):
         self.db = getdb()
         self.assertTrue(LOG_DIR.exists())
@@ -89,6 +97,7 @@ class TestDBIntegrity(unittest.TestCase):
         self.check_data(self.db)
         self.db.close()
 
+    @override
     def tearDown(self):
         self.db.close()
 
@@ -103,6 +112,7 @@ class TestDBIntegrity(unittest.TestCase):
             self.assertEqual(rows[i]["name"], fo)
         self.assertIsNone(db.execute("SELECT id FROM stations LIMIT 1").fetchone())
 
+    @override
     @classmethod
     def tearDownClass(cls) -> None:
         os.remove(str(LOG_DIR / "wm.db"))
@@ -111,6 +121,11 @@ class TestDBIntegrity(unittest.TestCase):
 
 
 class TestEntities(unittest.TestCase):
+    @override
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.db: sqlite3.Connection
+
     def test_01_load_entities(self):
         stations, operators = load_entities(self.db)
         self.assertEqual(len(stations), 0)
@@ -124,7 +139,7 @@ class TestEntities(unittest.TestCase):
             self.assertEqual(fo.name, FIELD_OPERATORS[i])
 
     def test_02_load_with_station(self):
-        self.db.executescript(
+        _ = self.db.executescript(
             "INSERT INTO stations (id, x, y, name) VALUES (1, 2, 3, 'shawty')"
         )
         stations, _ = load_entities(self.db)
@@ -140,23 +155,37 @@ class TestEntities(unittest.TestCase):
         self.assertEqual(sample_ws.name, "shawty")
         self.assertEqual(sample_ws.state, 0)
 
+    @override
     def setUp(self) -> None:
         self.db = getdb()
 
+    @override
     def tearDown(self) -> None:
         self.db.close()
 
+    @override
     @classmethod
     def tearDownClass(cls) -> None:
         os.remove(str(LOG_DIR / "wm.db"))
 
 
 class TestLoginServer(unittest.TestCase):
+    @override
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.shutdown: threading.Event
+        self.stations: dict[int, SimpleNamespace]
+        self.q: Queue[bytes]
+        self.server: threading.Thread
+        self.client: socket.socket
+
+    @override
     @classmethod
     def setUpClass(cls) -> None:
-        cls.login_port = 5000
-        cls.lock = threading.Lock()
+        cls.login_port: int = 5000
+        cls.lock: threading.Lock = threading.Lock()
 
+    @override
     def setUp(self):
         self.shutdown = threading.Event()
         self.stations = {
@@ -171,7 +200,6 @@ class TestLoginServer(unittest.TestCase):
             name="login-server",
             args=(self.login_port, self.stations, self.lock, self.q, self.shutdown),
         )
-        self.client: socket.socket
         self.server.start()
 
     def wait_for_server(self):
@@ -208,6 +236,7 @@ class TestLoginServer(unittest.TestCase):
                 return True
         return False
 
+    @override
     def tearDown(self):
         self.shutdown.set()
         if hasattr(self, "client") and self.client and self.client.fileno() != -1:
@@ -413,16 +442,26 @@ class TestLoginServer(unittest.TestCase):
 
 
 class TestWatchdog(unittest.TestCase):
+    @override
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.q: Queue[bytes]
+        self.shutdown: threading.Event
+        self.thread: threading.Thread
+        self.db: sqlite3.Connection
+
+    @override
     @classmethod
     def setUpClass(cls) -> None:
-        cls.db_path = LOG_DIR / "wm.db"
+        cls.db_path: Path = LOG_DIR / "wm.db"
 
+    @override
     def setUp(self) -> None:
         if self.db_path.exists():
             os.remove(str(self.db_path))
-        os.environ.pop("DOCKER_VOLUME", None)
-        os.environ.pop("LOG_DIR", None)
-        self.q: Queue[bytes] = Queue()
+        _ = os.environ.pop("DOCKER_VOLUME", None)
+        _ = os.environ.pop("LOG_DIR", None)
+        self.q = Queue()
         self.shutdown = threading.Event()
         self.thread = threading.Thread(
             target=watchdog,
@@ -432,6 +471,7 @@ class TestWatchdog(unittest.TestCase):
         )
         self.thread.start()
 
+    @override
     def tearDown(self) -> None:
         self.shutdown.set()
         self.q.put(bytes([EXIT]))
@@ -449,18 +489,18 @@ class TestWatchdog(unittest.TestCase):
         self.q.put(bytes([FLUSH_DB]))
         time.sleep(0.3)
 
-    def query(self, sql: str, params: tuple = ()) -> list[tuple]:
+    def query(self, sql: str, params: tuple[int | str, ...] = ()) -> list[tuple[int | str, ...]]:
         self.db = sqlite3.connect(self.db_path)
         try:
             return self.db.execute(sql, params).fetchall()
         finally:
             self.db.close()
 
-    def station(self, i: int) -> tuple | None:
+    def station(self, i: int) -> tuple[int | str, ...] | None:
         r = self.query("SELECT id, x, y, name, state FROM stations WHERE id = ?", (i,))
         return r[0] if r else None
 
-    def operator(self, i: int) -> tuple | None:
+    def operator(self, i: int) -> tuple[int | str, ...] | None:
         r = self.query(
             "SELECT id, x, y, name, cur_station FROM operators WHERE id = ?", (i,)
         )
@@ -584,13 +624,16 @@ class TestWatchdog(unittest.TestCase):
 
 
 class TestKafka(unittest.TestCase):
+    @override
     @classmethod
     def setUpClass(cls):
         pass
 
+    @override
     def setUp(self) -> None:
         pass
 
+    @override
     def tearDown(self) -> None:
         pass
 

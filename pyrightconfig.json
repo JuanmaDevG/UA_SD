@@ -7,5 +7,6 @@
     "WM_Central",
     "WM_FO",
     "WM_WS"],
-  "exclude": ["**/__pycache__"]
+  "exclude": ["**/__pycache__"],
+  "reportAny": false
 }
